@@ -792,3 +792,59 @@ def download(dav, remote_path, local_path, *, chunk=DOWNLOAD_CHUNK,
             f"实际 {os.path.getsize(part)} 字节。留下 {part} 以便续传。")
     os.replace(part, local_path)
     return local_path, total
+
+
+# ─────────────────────────────── 上传 ───────────────────────────────
+
+VERIFY_TAIL_BYTES = 64
+
+
+def upload(dav, local_path, remote_path, *, verify="size",
+           progress=None) -> int:
+    """把本地文件传上去，传完校验。
+
+    verify='size'   核对远端大小（默认，省一次请求）
+    verify='strong' 再读回末尾若干字节比对内容
+    """
+    if not os.path.isfile(local_path):
+        raise UsageError(f"本地文件不存在: {local_path}")
+    size = os.path.getsize(local_path)
+
+    def factory():
+        return open(local_path, "rb")
+
+    dav.put(remote_path, StreamBody(factory, size))
+
+    entry = dav.stat(remote_path)
+    if entry.size != size:
+        raise NsdavError(
+            f"上传后大小不符：{remote_path} 期望 {size}，远端 {entry.size}")
+
+    if verify == "strong" and size > 0:
+        tail = min(VERIFY_TAIL_BYTES, size)
+        start = size - tail
+        with open(local_path, "rb") as f:
+            f.seek(start)
+            local_tail = f.read()
+        target = dav.target(remote_path)
+        with dav.t.stream("GET", target,
+                          headers={"Range": f"bytes={start}-{size - 1}"}) as r:
+            if r.status not in (200, 206):
+                raise NsdavError(f"回读校验失败：HTTP {r.status}")
+            # 200 = 服务端忽略 Range，整个文件都回了过来；206 = 只回我们要的尾巴。
+            # 两种都只留最后 tail 字节的滚动窗口 —— 整份 read() 会把远端文件全
+            # 读进内存，而这条路本来就承认 200 是合法响应（iSH 上内存比时间金贵，
+            # T9 的回退分支踩过同一个坑）。200 那条路上，尾巴在流的末尾。
+            remote_tail = b""
+            while True:
+                buf = r.body.read(65536)
+                if not buf:
+                    break
+                remote_tail = (remote_tail + buf)[-tail:]
+        if remote_tail[-tail:] != local_tail:
+            raise NsdavError(
+                f"上传内容校验失败：{remote_path} 末尾字节与本地不一致")
+
+    if progress:
+        progress(size, size)
+    return size

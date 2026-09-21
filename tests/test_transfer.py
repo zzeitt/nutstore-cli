@@ -310,3 +310,110 @@ def test_progress_reports_when_part_is_already_complete(dav, tmp_path):
 
     assert dest.read_bytes() == payload
     assert seen == [(51200, 51200)], seen
+
+
+def test_upload_small(dav, tmp_path):
+    s, base = dav
+    d, t = _dav(s, base)
+    src = tmp_path / "u.txt"
+    src.write_bytes(b"payload")
+    n = nsdav.upload(d, str(src), "/u.txt")
+    assert n == 7
+    assert s.store["/u.txt"] == b"payload"
+
+
+def test_upload_creates_parents(dav, tmp_path):
+    s, base = dav
+    d, t = _dav(s, base)
+    src = tmp_path / "u.txt"
+    src.write_bytes(b"x")
+    nsdav.upload(d, str(src), "/deep/dir/u.txt")
+    assert s.store["/deep/dir/u.txt"] == b"x"
+    # mock 现在对"父集合不存在"回 409，所以这条同时真的走过了 put 的补建重试。
+    assert "/deep" in s.dirs and "/deep/dir" in s.dirs
+
+
+def test_upload_verifies_size(dav, tmp_path, monkeypatch):
+    s, base = dav
+    d, t = _dav(s, base)
+    src = tmp_path / "u.txt"
+    src.write_bytes(b"12345")
+
+    real_stat = d.stat
+    def lying_stat(p):
+        e = real_stat(p)
+        e.size = 3                      # 假装服务端只存了 3 字节
+        return e
+    monkeypatch.setattr(d, "stat", lying_stat)
+
+    with pytest.raises(nsdav.NsdavError, match="大小不符"):
+        nsdav.upload(d, str(src), "/u.txt")
+
+
+def test_upload_strong_verify_detects_corruption(dav, tmp_path):
+    """strong 要抓到"长度不变、内容变了"，而 size 校验抓不到。
+
+    篡改的是**末尾** 10 字节，因为 strong 读回并比对的是末尾 VERIFY_TAIL_BYTES
+    个字节。这条用例原先篡改的是开头 10 字节，读回窗口覆盖不到 —— 实测
+    （T10 预检，5 条里红 1 条）红在 `DID NOT RAISE NsdavError`，用例无法为它
+    名字里的行为而通过。`verify="size"` 那一段钉住"两种校验真有差别"：长度
+    没变时 size 校验必须放行，否则 strong 多花的那个请求就没有意义。
+    """
+    s, base = dav
+    d, t = _dav(s, base)
+    src = tmp_path / "u.txt"
+    payload = b"abcdefghij" * 10        # 100 字节
+    src.write_bytes(payload)
+
+    # 让 PUT 写完就篡改**末尾**内容，长度不变 —— 只有 strong 校验能发现
+    real_put = d.put
+    def corrupting_put(p, data):
+        real_put(p, data)
+        s.store[p] = payload[:-10] + b"XXXXXXXXXX"
+    d.put = corrupting_put
+
+    # 长度没变，size 校验看不出来
+    assert nsdav.upload(d, str(src), "/u.txt", verify="size") == 100
+    with pytest.raises(nsdav.NsdavError, match="校验失败"):
+        nsdav.upload(d, str(src), "/u.txt", verify="strong")
+
+
+def test_upload_does_not_read_whole_file_into_memory(dav, tmp_path):
+    """大文件必须走流式，验证传给 transport 的是 StreamBody 而不是 bytes。"""
+    s, base = dav
+    d, t = _dav(s, base)
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"z" * (3 * 1024 * 1024))
+    seen = []
+    real_put = d.put
+    def spy(p, data):
+        seen.append(type(data).__name__)
+        return real_put(p, data)
+    d.put = spy
+    nsdav.upload(d, str(src), "/big.bin")
+    assert seen == ["StreamBody"]
+
+
+def test_strong_verify_streams_when_server_ignores_range(dav, tmp_path):
+    """服务端忽略 Range（回 200 全量）时，回读校验只留末尾的 tail 字节。
+
+    这条路此前一个用例都走不到（mock 默认支持 Range），而它明确承认 200 是
+    合法响应。整份 `read()` 会把远端文件全读进内存 —— 与 T9 回退分支同一个
+    坑。断言两层：任何一次 read 都带正数长度（形状），以及"内容对得上时不
+    误报"（滚动窗口必须留**末尾**；只留开头会在这里假报警）。
+    """
+    s, base = dav
+    d, t = _dav(s, base)
+    payload = bytes(range(256)) * 32768          # 8 MiB
+    src = tmp_path / "big.bin"
+    src.write_bytes(payload)
+    s.add_file("/big.bin", payload)              # 远端内容与本地一致
+    s.ignore_range = True
+    spies = _spy_stream(t)
+
+    n = nsdav.upload(d, str(src), "/big.bin", verify="strong")
+
+    assert n == len(payload)
+    sizes = [x for sp in spies for x in sp.sizes]
+    assert sizes, "一次 read 都没有？"
+    assert all(isinstance(x, int) and 0 < x <= 65536 for x in sizes), sizes
