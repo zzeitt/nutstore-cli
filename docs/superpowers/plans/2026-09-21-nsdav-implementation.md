@@ -1056,7 +1056,7 @@ class MockDAV:
     def __init__(self, *, page_size=None, fail_first_n=0, fail_status=503,
                  latency=0.0, user="u", password="p"):
         self.page_size = page_size
-        self.fail_first_n = fail_first_n
+        self._fail_first_n = fail_first_n
         self.fail_status = fail_status
         self.latency = latency
         self.user = user
@@ -1067,6 +1067,21 @@ class MockDAV:
         self._failures_left = fail_first_n
         self._srv = None
         self._thread = None
+
+    # `fail_status`、`page_size`、`latency` 都是每次请求现读的，只有这一个
+    # 在 __init__ 里被抄进 _failures_left。于是 `start()` 之后再写
+    # `s.fail_first_n = 1`（Task 7 的 test_stream_body_retry_reopens_file
+    # 就是这么写的）被静默忽略：不注入 503，那条用例首次请求就成功，
+    # 永远不会碰到它名字里那个重试——StreamBody 重试时重开文件这件事
+    # 也就没人看。做成属性，设值时一并重置计数器。
+    @property
+    def fail_first_n(self):
+        return self._fail_first_n
+
+    @fail_first_n.setter
+    def fail_first_n(self, n):
+        self._fail_first_n = n
+        self._failures_left = n
 
     # ── 生命周期 ──
     def start(self) -> str:
@@ -1154,6 +1169,15 @@ class MockDAV:
 
             def _do_put(self, body):
                 rel = self._rel()
+                # 父集合不存在时必须 409（RFC 4918）。无条件回 201 的话，
+                # WebDAV.put 里"撞 409 → mkdirs → 重试"那段永远走不到，
+                # 而且 mock 会造出真实服务器不可能有的状态：这个文件 GET 得到，
+                # 却不出现在任何一次列表里。真实服务器就是这里回 409，
+                # put 的补建逻辑正是照它写的。
+                parent = rel.rstrip("/").rsplit("/", 1)[0] or "/"
+                if parent not in outer.dirs:
+                    self._simple(409)
+                    return
                 existed = rel in outer.store
                 outer.store[rel] = body
                 self._simple(204 if existed else 201)
@@ -1260,8 +1284,14 @@ class MockDAV:
                 if outer.page_size and len(items) > outer.page_size:
                     page = items[:outer.page_size]
                     last = page[-1][0]
+                    # 路径要和 href 用同一套编码。`rel` 是解码后的形式，直接拼进去
+                    # 会发出一个带裸空格的非法 URI；中文目录名更糟——send_header
+                    # 会抛 UnicodeEncodeError，客户端只看到 RemoteDisconnected。
+                    # 而且真实服务器给的本来就是编码过的分页 URL，mock 若只发这一种
+                    # 形式，客户端就只能自己再编一遍，正好落进本项目禁止的双编码。
+                    href = BASE_PATH + quote(rel, safe="/")
                     link = (f"<http://{self.headers.get('Host', '127.0.0.1')}"
-                            f"{BASE_PATH}{rel}?mk=" + quote(last, safe="") +
+                            f"{href}?mk=" + quote(last, safe="") +
                             '>; rel="next"')
                     items = page
 
@@ -1467,6 +1497,86 @@ def test_mock_root_delete_clears_the_tree():
         # 根是常驻的：内容清空后根自己还在，只有自身那一条。
         st, _, bd = _req(base, "PROPFIND", "/dav/", headers={"Depth": "1"})
         assert st == 207 and bd.count(b"<d:response>") == 1
+    finally:
+        s.stop()
+
+
+def test_mock_put_into_missing_collection_conflicts():
+    """PUT 的父集合不存在时必须 409，和真实服务器一致。
+
+    这是 `WebDAV.put` 自动补建父目录那段的触发条件。mock 原来无条件回 201，
+    那段就一次都没跑过；更糟的是它造出了真实服务器不可能有的状态——文件 GET
+    得到，却不出现在任何一次列表里。
+    """
+    s = MockDAV(); base = s.start()
+    try:
+        assert _req(base, "PUT", "/dav/nope/f.txt", b"x")[0] == 409
+        assert s.store == {}                     # 409 不能顺手把内容存下
+        assert _req(base, "MKCOL", "/dav/nope")[0] == 201
+        assert _req(base, "PUT", "/dav/nope/f.txt", b"x")[0] == 201
+        assert s.store["/nope/f.txt"] == b"x"
+    finally:
+        s.stop()
+
+
+def test_mock_link_url_is_encoded():
+    """Link 里的路径必须和 href 一样是编码过的。
+
+    分页 URL 由客户端原样透传（`url_to_target` 既不解码也不再编码），所以
+    mock 发出带裸空格或非 ASCII 的 Link，客户端跟随时要么 `InvalidURL`、要么
+    `UnicodeEncodeError`（中文名会在 `send_header` 里炸，客户端只见
+    RemoteDisconnected）。而真实服务器给的本来就是编码过的分页 URL——mock 若
+    只发这一种形式，客户端就只能自己再编一遍，正好落进本项目禁止的双编码。
+
+    走**全部**页，不是在第二页停手：page_size=2 而这里有 5 条，所以是 2+2+1
+    三页。第二页自己还会再发一个 Link，早停会把第三页整个漏掉——而"分页悄悄
+    丢条目"正是这条要挡的东西。
+    """
+    s = MockDAV(page_size=2); base = s.start()
+    try:
+        _req(base, "MKCOL", "/dav/my%20dir")
+        for i in range(4):
+            # 用 f-string，别用 % 格式化：`%20d` 会被当成宽度 20 的 %d。
+            _req(base, "PUT", f"/dav/my%20dir/f{i}.txt", b"x")
+        hrefs = []
+        target = "/dav/my%20dir"
+        pages = 0
+        while True:
+            pages += 1
+            st, hd, bd = _req(base, "PROPFIND", target, headers={"Depth": "1"})
+            assert st == 207
+            hrefs += [h.split(b"<")[0] for h in bd.split(b"<d:href>")[1:]]
+            if "Link" not in hd:
+                break
+            link = hd["Link"].split(">")[0].lstrip("<")
+            assert link.isascii() and " " not in link, link
+            sp = urllib.parse.urlsplit(link)
+            assert sp.path == "/dav/my%20dir", sp.path
+            target = sp.path + "?" + sp.query
+        assert pages == 3, pages
+        assert sorted(hrefs) == [
+            b"/dav/my%20dir/", b"/dav/my%20dir/f0.txt", b"/dav/my%20dir/f1.txt",
+            b"/dav/my%20dir/f2.txt", b"/dav/my%20dir/f3.txt"]
+    finally:
+        s.stop()
+
+
+def test_mock_fail_first_n_can_be_set_after_start():
+    """start() 之后再设 fail_first_n 也必须生效。
+
+    `fail_status`、`page_size`、`latency` 都是每次请求现读的，只有
+    `fail_first_n` 在构造时被抄进 `_failures_left`。Task 7 的
+    `test_stream_body_retry_reopens_file` 正是在 start() 之后写
+    `s.fail_first_n = 1`——快照版本下不注入故障，那条用例首次请求就成功，
+    永远碰不到它名字里的重试，`StreamBody` 重试时重开文件也就没人看。
+    """
+    s = MockDAV(); base = s.start()
+    try:
+        s.fail_first_n = 2
+        s.fail_status = 503
+        assert _req(base, "PROPFIND", "/dav/", headers={"Depth": "0"})[0] == 503
+        assert _req(base, "PROPFIND", "/dav/", headers={"Depth": "0"})[0] == 503
+        assert _req(base, "PROPFIND", "/dav/", headers={"Depth": "0"})[0] == 207
     finally:
         s.stop()
 ```
