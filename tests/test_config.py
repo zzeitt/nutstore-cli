@@ -52,10 +52,17 @@ def test_cli_args_beat_env():
 
 
 def test_config_file_used_when_env_absent():
+    """config 的 url 真的被用上：主机/端口/明文/路径四项都要断言。
+
+    用非默认值（默认是 https://dav.jianguoyun.com/dav）—— 拿默认值断言的话，
+    "根本没读 config 的 url"这个变异也能全绿。
+    """
     c = nsdav.load_config(Args(), env={}, config={
-        "url": "https://dav.jianguoyun.com/dav",
+        "url": "http://cfg.example.com:8081/dav2",
         "user": "file@x.com", "password": "filepw",
     })
+    assert (c.host, c.port, c.use_tls, c.base_path) == (
+        "cfg.example.com", 8081, False, "/dav2")
     assert c.user == "file@x.com" and c.password == "filepw"
 
 
@@ -72,6 +79,7 @@ def test_missing_credentials_raise_with_guidance():
     msg = str(ei.value)
     assert "NSDAV_WEBDAV_USER" in msg
     assert "--user" in msg
+    assert "config.toml" in msg
 
 
 def test_min_gap_and_retries_overridable():
@@ -182,3 +190,44 @@ def test_config_spreads_directly_into_transport():
                         timeout=c.timeout)
     assert (t.host, t.port, t.use_tls) == ("127.0.0.1", 8080, False)
     assert t.base_path == "/dav" and t.max_retries == 5 and t.timeout == 120.0
+
+
+# ── 修复轮 1：复审提出的洞 ──
+
+@pytest.mark.parametrize("bad", ["https://h:99999/dav", "https://h:abc/dav"])
+def test_bad_port_is_usage_error_not_valueerror(bad):
+    """端口越界/非数字要报 UsageError（exit 2），不是裸 ValueError 的 traceback。"""
+    with pytest.raises(nsdav.UsageError):
+        nsdav.load_config(Args(url=bad), env={}, config={})
+
+
+@pytest.mark.parametrize("key,value", [
+    ("NSDAV_MIN_GAP", "-1"),
+    ("NSDAV_MAX_RETRIES", "-1"),
+    ("NSDAV_TIMEOUT", "0"),
+    ("NSDAV_TIMEOUT", "-5"),
+])
+def test_out_of_range_numbers_are_usage_errors(key, value):
+    """三个旋钮的下限：min_gap/max_retries 不能小于 0，timeout 必须大于 0。"""
+    env = {"NSDAV_WEBDAV_USER": "u", "NSDAV_WEBDAV_PASSWORD": "p", key: value}
+    with pytest.raises(nsdav.UsageError):
+        nsdav.load_config(Args(), env=env, config={})
+
+
+def test_version_gate_warns_and_ignores_config(tmp_path, monkeypatch, capsys):
+    """没有 tomllib 时：配置文件被忽略，但必须**出声**，不能静默。"""
+    path = _write(tmp_path, 'url = "https://h/dav"\n')
+    monkeypatch.setattr(nsdav, "TOML_AVAILABLE", False)
+    assert nsdav._read_config_file(path) == {}
+    err = capsys.readouterr().err
+    assert "已忽略配置文件" in err and path in err
+
+
+def test_config_file_path_falls_back_to_dot_config(monkeypatch):
+    """没设 XDG_CONFIG_HOME 时落到 ~/.config（expanduser 的结果）。"""
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setattr(nsdav.os.path, "expanduser",
+                        lambda p: "/fake/home" if p == "~" else p)
+    # 分隔符交给 os.path.join：本仓库在 Windows 上跑，硬编 "/" 会红。
+    assert nsdav.config_file_path() == os.path.join(
+        "/fake/home", ".config", "nsdav", "config.toml")
