@@ -1839,7 +1839,15 @@ def test_listdir_follows_pagination():
 
 
 def test_pagination_does_not_double_encode_special_names():
-    """目录名含空格时分页必须仍然正确 —— 这是双编码 bug 的回归测试。"""
+    """目录名含空格时分页必须仍然正确 —— 这是双编码 bug 的回归测试。
+
+    只断言"拿到 7 个名字"是个**代理**：它确实会被双编码打破（mock 存的路径
+    是未编码的，双编码的 marker 解码后变成 `%20` 字面量，按 `%`(0x25) >
+    ` `(0x20) 排序，所有条目都落在 marker 之前而被丢掉，于是只剩 3 个），但
+    失败信息只说"少了几条"，不说为什么。所以这里直接把**机制**钉住：
+    第二次 PROPFIND 的 target 必须单编码。`%20` 与 `%2520` 那两行就是
+    红线本身，双编码一出现就以自己的名字失败。
+    """
     s = MockDAV(page_size=3); base = s.start()
     try:
         d = _dav(s, base)
@@ -1848,6 +1856,11 @@ def test_pagination_does_not_double_encode_special_names():
             d.put(f"/my dir/f{i}.txt", b"x")
         names = sorted(e.name for e in d.listdir("/my dir"))
         assert len(names) == 7
+
+        propfinds = [t for m, t in s.requests if m == "PROPFIND"]
+        assert len(propfinds) >= 2, "page_size=3 / 7 个文件，必须真的翻页"
+        assert "%20" in propfinds[1], "第二页的 marker 丢了单编码"
+        assert "%2520" not in propfinds[1], "marker 被二次编码了"
     finally:
         s.stop()
 
