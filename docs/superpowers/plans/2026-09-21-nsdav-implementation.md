@@ -2013,7 +2013,13 @@ class Transport:
                            r)          # type: ignore[arg-type]
         finally:
             try:
-                r.read()            # 读完，连接才能复用
+                # 读干净连接才能复用，但必须按块读：整份 read() 会在**中途失败**
+                # 时把剩下的全部字节一次装进内存 —— 磁盘写满（ENOSPC）、进度
+                # 回调抛异常、Ctrl-C 都从这条 finally 穿出去，而 .part/续传存在
+                # 的理由正是这些场景。成功路径上两条循环都读到了 EOF，drain
+                # 读到的是空串，所以这个洞只有失败路径看得见。
+                while r.read(65536):
+                    pass
             except Exception:
                 self._drop_conn()
 
@@ -2675,6 +2681,9 @@ class _ReadSpy:
         self.sizes.append(n)
         return self.raw.read(n)
 
+    def __getattr__(self, name):
+        return getattr(self.raw, name)
+
 
 def _spy_stream(t):
     """把 t.stream 包一层，换掉响应体好记录 read 索要的大小。
@@ -2720,7 +2729,56 @@ def test_ignored_range_fallback_still_reads_in_chunks(dav, tmp_path):
     assert dest.read_bytes() == payload
     sizes = [n for sp in spies for n in sp.sizes]
     assert sizes, "一次 read 都没有？"
-    assert all(isinstance(n, int) and n > 0 for n in sizes), sizes
+    assert all(isinstance(n, int) and 0 < n <= 65536 for n in sizes), sizes
+
+
+class _ConnSpy:
+    """把 `_get_conn()` 交出去的那条连接包一层，让 getresponse 交回可数的响应。"""
+
+    def __init__(self, conn, sink):
+        self._conn = conn
+        self._sink = sink
+
+    def request(self, *a, **kw):
+        self._conn.request(*a, **kw)
+
+    def getresponse(self):
+        r = _ReadSpy(self._conn.getresponse())
+        self._sink.append(r)
+        return r
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_stream_drain_on_failure_is_bounded(dav):
+    """离开 `with` 时要把剩余响应体读干净（连接才能复用），但必须按块读。
+
+    成功路径看不出问题：两条下载循环都读到了 EOF，drain 读到空串。**中途失败**
+    才看得见 —— 磁盘写满（ENOSPC，`.part`/续传存在的理由）、进度回调抛异常、
+    Ctrl-C 都从这条 finally 穿出去，而整份 `read()` 会把剩余字节一次装进内存：
+    一个 1 GiB 的下载在写满磁盘的瞬间，还要额外要一份剩余大小的内存。断言形状
+    ——任何一次 read 都带正数且不超过 64 KiB。
+    """
+    s, base = dav
+    d, t = _dav(s, base)
+    payload = bytes(range(256)) * 32768          # 8 MiB
+    s.add_file("/huge.bin", payload)
+
+    sink = []
+    real_get = t._get_conn
+    t._get_conn = lambda: _ConnSpy(real_get(), sink)
+
+    with pytest.raises(RuntimeError):
+        with t.stream("GET", d.target("/huge.bin"),
+                      headers={"Range": "bytes=0-8388607"}) as resp:
+            assert resp.status == 206
+            resp.body.read(1024)                 # 只读一点就炸
+            raise RuntimeError("模拟中途失败")
+
+    sizes = [n for r in sink for n in r.sizes]
+    assert sizes, "一次 read 都没有？"
+    assert all(isinstance(n, int) and 0 < n <= 65536 for n in sizes), sizes
     # 回退路径只有这条用例走得到，进度也就只能在这里钉：一路报到 total。
     assert seen[-1] == (len(payload), len(payload)), seen[-1]
 
@@ -2740,8 +2798,9 @@ def test_progress_reports_from_the_resume_point(dav, tmp_path):
                    progress=lambda done, total: seen.append((done, total)))
 
     assert dest.read_bytes() == payload
-    assert seen[-1] == (51200, 51200), seen
-    assert seen[0][0] > 20000, seen              # 第一次报就已包含已有字节
+    # 逐块上报：chunk=8192、断点 20000，四块各报一次，末值到 total
+    assert seen == [(28192, 51200), (36384, 51200), (44576, 51200),
+                    (51200, 51200)], seen
 
 
 def test_progress_reports_when_part_is_already_complete(dav, tmp_path):
@@ -3005,7 +3064,7 @@ def test_strong_verify_streams_when_server_ignores_range(dav, tmp_path):
     assert n == len(payload)
     sizes = [x for sp in spies for x in sp.sizes]
     assert sizes, "一次 read 都没有？"
-    assert all(isinstance(x, int) and x > 0 for x in sizes), sizes
+    assert all(isinstance(x, int) and 0 < x <= 65536 for x in sizes), sizes
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
