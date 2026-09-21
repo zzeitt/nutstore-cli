@@ -288,7 +288,15 @@ def backoff_delay(
     jitter: float = 0.25,
     rand: Callable[[], float] = random.random,
 ) -> float:
-    """第 attempt 次重试前该等多久（attempt 从 1 开始）。"""
+    """第 attempt 次重试前该等多久（attempt 从 1 开始）。
+
+    抖动在封顶**之前**加，所以 `_BACKOFF_CAP` 是实际等待时间的真正上界。
+    反过来先封顶再加抖动的话，rand() 取 1.0 时会等到 75 秒，而规格说的是
+    封顶 60 秒。代价是退避到顶之后抖动只剩一半区间（48~60 而不是 45~75），
+    但本工具是串行的、还有 200ms 最小间隔，抖动的意义本就只是兜底，不值得
+    为它让规格里那句承诺变成假的。
+    """
     base = _BACKOFF_BASE_HARD if status in (429, 503) else _BACKOFF_BASE_SOFT
-    raw = min(base * (2 ** (attempt - 1)), _BACKOFF_CAP)
-    return raw * (1.0 + jitter * (2.0 * rand() - 1.0))
+    raw = base * (2 ** (attempt - 1))
+    raw *= 1.0 + jitter * (2.0 * rand() - 1.0)
+    return min(raw, _BACKOFF_CAP)

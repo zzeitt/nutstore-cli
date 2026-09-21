@@ -25,8 +25,27 @@ def test_backoff_for_connection_error_starts_lower():
     assert nsdav.backoff_delay(1, None, rand=_no_jitter) == 0.5
 
 
+def test_backoff_for_429_also_starts_at_two_seconds():
+    """429 的起跳值要和 503 一样是 2 秒。
+
+    只断言 `429 in RETRYABLE_STATUS` 抓不住"重试它，但按 0.5 秒起跳"这种
+    实现——那等于没把 429 当成降速信号。必须断言它的**基值**。
+    """
+    assert nsdav.backoff_delay(1, 429, rand=_no_jitter) == 2.0
+
+
 def test_backoff_is_capped():
     assert nsdav.backoff_delay(20, 503, rand=_no_jitter) == 60.0
+
+
+def test_backoff_never_exceeds_the_cap():
+    """封顶是**实际等待时间**的上界，抖动加完也不能越过。
+
+    先封顶再加抖动的话，rand() 取 1.0 时实际会等到 60*1.25 = 75 秒，而规格
+    写的是封顶 60 秒——用户读到的是一个代码不兑现的承诺。
+    """
+    assert nsdav.backoff_delay(20, 503, rand=lambda: 1.0) == 60.0
+    assert nsdav.backoff_delay(20, None, rand=lambda: 1.0) == 60.0
 
 
 def test_jitter_stays_within_bounds():
@@ -34,11 +53,3 @@ def test_jitter_stays_within_bounds():
     hi = nsdav.backoff_delay(3, 503, rand=lambda: 1.0)
     assert lo == 8.0 * 0.75
     assert hi == 8.0 * 1.25
-
-
-def test_backoff_for_429_also_starts_at_two_seconds():
-    # brief 正文写明 429 与 503 同为硬档（起跳 2 秒），但上面 5 条里只有
-    # 503 钉了起跳值 —— 把 429 归到软档（0.5s）的实现在那 5 条下全绿。
-    # 这条补上另一半：429 与 503 共用同一个 base。
-    assert nsdav.backoff_delay(1, 429, rand=_no_jitter) == 2.0
-    assert nsdav.backoff_delay(2, 429, rand=_no_jitter) == 4.0
