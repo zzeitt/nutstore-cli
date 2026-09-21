@@ -737,7 +737,7 @@ git commit -m "feat(core): 按命名空间解析 PROPFIND 多状态响应"
 **设计取舍：** 插件在 503 上是**死等 60 秒**且不可中断。这里改成指数退避：
 429/503 起跳 2 秒，其它 5xx 与连接错误起跳 0.5 秒，封顶 60 秒，带 ±25% 抖动
 （抖动是为了避免多个客户端同时重试形成尖峰）。5 次重试累计约 62 秒，
-与插件量级相当但能快速失败。
+与插件量级相当但能快速失败。**60 秒是实际等待时间的上界**，抖动加完再封顶。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -771,8 +771,27 @@ def test_backoff_for_connection_error_starts_lower():
     assert nsdav.backoff_delay(1, None, rand=_no_jitter) == 0.5
 
 
+def test_backoff_for_429_also_starts_at_two_seconds():
+    """429 的起跳值要和 503 一样是 2 秒。
+
+    只断言 `429 in RETRYABLE_STATUS` 抓不住"重试它，但按 0.5 秒起跳"这种
+    实现——那等于没把 429 当成降速信号。必须断言它的**基值**。
+    """
+    assert nsdav.backoff_delay(1, 429, rand=_no_jitter) == 2.0
+
+
 def test_backoff_is_capped():
     assert nsdav.backoff_delay(20, 503, rand=_no_jitter) == 60.0
+
+
+def test_backoff_never_exceeds_the_cap():
+    """封顶是**实际等待时间**的上界，抖动加完也不能越过。
+
+    先封顶再加抖动的话，rand() 取 1.0 时实际会等到 60*1.25 = 75 秒，而规格
+    写的是封顶 60 秒——用户读到的是一个代码不兑现的承诺。
+    """
+    assert nsdav.backoff_delay(20, 503, rand=lambda: 1.0) == 60.0
+    assert nsdav.backoff_delay(20, None, rand=lambda: 1.0) == 60.0
 
 
 def test_jitter_stays_within_bounds():
@@ -806,10 +825,18 @@ def backoff_delay(
     jitter: float = 0.25,
     rand: Callable[[], float] = random.random,
 ) -> float:
-    """第 attempt 次重试前该等多久（attempt 从 1 开始）。"""
+    """第 attempt 次重试前该等多久（attempt 从 1 开始）。
+
+    抖动在封顶**之前**加，所以 `_BACKOFF_CAP` 是实际等待时间的真正上界。
+    反过来先封顶再加抖动的话，rand() 取 1.0 时会等到 75 秒，而规格说的是
+    封顶 60 秒。代价是退避到顶之后抖动只剩一半区间（48~60 而不是 45~75），
+    但本工具是串行的、还有 200ms 最小间隔，抖动的意义本就只是兜底，不值得
+    为它让规格里那句承诺变成假的。
+    """
     base = _BACKOFF_BASE_HARD if status in (429, 503) else _BACKOFF_BASE_SOFT
-    raw = min(base * (2 ** (attempt - 1)), _BACKOFF_CAP)
-    return raw * (1.0 + jitter * (2.0 * rand() - 1.0))
+    raw = base * (2 ** (attempt - 1))
+    raw *= 1.0 + jitter * (2.0 * rand() - 1.0)
+    return min(raw, _BACKOFF_CAP)
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
