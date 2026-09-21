@@ -6,11 +6,12 @@
 from __future__ import annotations
 
 import email.utils
+import random
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import timezone
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote, unquote, urlsplit
 
 __version__ = "0.1.0"
@@ -269,3 +270,25 @@ def parse_multistatus(xml_bytes: bytes, base_path: str) -> list[Entry]:
         out.append(Entry(path=rel, name=name, is_dir=is_dir,
                          size=0 if is_dir else size, mtime=mtime))
     return out
+
+
+# ──────────────────────────── 重试与退避 ────────────────────────────
+
+RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+_BACKOFF_BASE_SOFT = 0.5    # 连接错误、普通 5xx
+_BACKOFF_BASE_HARD = 2.0    # 429 / 503，服务端明确要求降速
+_BACKOFF_CAP = 60.0
+
+
+def backoff_delay(
+    attempt: int,
+    status: int | None,
+    *,
+    jitter: float = 0.25,
+    rand: Callable[[], float] = random.random,
+) -> float:
+    """第 attempt 次重试前该等多久（attempt 从 1 开始）。"""
+    base = _BACKOFF_BASE_HARD if status in (429, 503) else _BACKOFF_BASE_SOFT
+    raw = min(base * (2 ** (attempt - 1)), _BACKOFF_CAP)
+    return raw * (1.0 + jitter * (2.0 * rand() - 1.0))
