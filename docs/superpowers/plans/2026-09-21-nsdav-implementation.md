@@ -3192,13 +3192,18 @@ git commit -m "feat(config): 参数/环境变量/配置文件三级优先级"
 
 **Interfaces:**
 - Consumes: 前面全部
-- Produces: `build_parser() -> argparse.ArgumentParser`、`cmd_*` 函数、`main(argv=None) -> int`、`format_size(n) -> str`
+- Produces: `build_parser() -> argparse.ArgumentParser`、`cmd_*` 函数与 `_dispatch(args, dav)` / `_COMMANDS` 分发表、`main(argv=None) -> int`、`format_size(n) -> str`
 
 **约定：**
 - 人类可读输出到 stdout；`--json` 时输出 JSON。
 - 进度与日志到 stderr。
 - `rm -r` 不给 `-y` 时先列出待删项并要求确认。
 - `main()` 捕获 `NsdavError`，打印到 stderr，返回 `exc.exit_code`。
+- **关于 import（承 P6）：** 本节代码块不含 import，实现者自己补
+  `import argparse` 与 `import json`（`nsdav.py` 顶部：前者在 `base64` 前，
+  后者在 `http.client` 后；`sys`/`os` 已有）。漏了它们，`tests/test_cli.py`
+  11 条全红在 `NameError: name 'argparse' is not defined`（实测，见 ledger 的
+  整体预检）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -3413,7 +3418,197 @@ def cfg_verbose() -> bool:
     return _VERBOSE
 ```
 
-命令函数按下列行为实现（每个都在 `main` 的 dispatch 表里注册）：
+```python
+# ── 命令分发 ──
+
+def _progress(done: int, total: int | None) -> None:
+    """下载进度写 stderr —— stdout 留给数据与 --json。"""
+    if not total:
+        return
+    sys.stderr.write(f"\r  {format_size(done)} / {format_size(total)}"
+                     f"  ({done * 100.0 / total:5.1f}%)")
+    if done >= total:
+        sys.stderr.write("\n")
+
+
+def _confirm(prompt: str) -> bool:
+    try:
+        return input(prompt).strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def _print_entry(e: Entry, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(_entry_dict(e), ensure_ascii=False, indent=2))
+    elif e.is_dir:
+        print(f"{e.path}/")
+    else:
+        print(f"{e.path}  {format_size(e.size)}")
+
+
+def cmd_ls(dav, args) -> int:
+    _print_entries(dav.listdir(args.path), args.json)
+    return EXIT_OK
+
+
+def cmd_stat(dav, args) -> int:
+    _print_entry(dav.stat(args.path), args.json)
+    return EXIT_OK
+
+
+def cmd_tree(dav, args) -> int:
+    root = normalize_remote_path(args.path)
+    root_segs = len([s for s in root.split("/") if s])
+    if args.json:
+        _print_entries(list(dav.walk(root, max_depth=args.depth)), True)
+        return EXIT_OK
+    print(root)
+    for e in dav.walk(root, max_depth=args.depth):
+        segs = len([s for s in e.path.rstrip("/").split("/") if s])
+        indent = "  " * max(segs - root_segs - 1, 0)
+        print(f"{indent}{e.name}{'/' if e.is_dir else ''}")
+    return EXIT_OK
+
+
+def cmd_cat(dav, args) -> int:
+    sys.stdout.buffer.write(dav.read(args.path))
+    sys.stdout.buffer.flush()
+    return EXIT_OK
+
+
+def cmd_get(dav, args) -> int:
+    remote = normalize_remote_path(args.remote)
+    local = args.local or os.path.basename(remote.rstrip("/")) or "download"
+    if args.dry_run:
+        print(f"将下载 {remote} → {local}")
+        return EXIT_OK
+    path, n = download(dav, remote, local, transport=dav.t,
+                       progress=None if args.quiet else _progress)
+    if not args.quiet:
+        print(f"已下载 {format_size(n)} → {path}", file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_put(dav, args) -> int:
+    remote = normalize_remote_path(
+        args.remote or "/" + os.path.basename(args.local))
+    if args.dry_run:
+        print(f"将上传 {args.local} → {remote}")
+        return EXIT_OK
+    n = upload(dav, args.local, remote, verify=args.verify)
+    if not args.quiet:
+        print(f"已上传 {format_size(n)} → {remote}", file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_mkdir(dav, args) -> int:
+    if args.dry_run:
+        print(f"将创建 {args.path}")
+        return EXIT_OK
+    if args.parents:
+        dav.mkdirs(args.path)
+    else:
+        dav.mkcol(args.path)
+    return EXIT_OK
+
+
+def cmd_rm(dav, args) -> int:
+    # 先子后父：walk 是 BFS（父在子前），把它放在最前面、目标目录放最后，
+    # 顺序恰好是先删空每一层、最后删根。反过来会先删父目录、子项已不存在。
+    targets = [normalize_remote_path(args.path)]
+    if args.recursive and dav.stat(args.path).is_dir:
+        targets = [e.path for e in dav.walk(args.path)] + targets
+    if args.recursive and not args.yes and not args.dry_run:
+        for p in targets:
+            print(p)
+        if not _confirm(f"以上 {len(targets)} 项将被递归删除，确认？[y/N] "):
+            print("已取消", file=sys.stderr)
+            return EXIT_ERROR
+    for p in targets:
+        if args.dry_run:
+            print(f"将删除 {p}")
+        else:
+            dav.delete(p, recursive=args.recursive)
+    return EXIT_OK
+
+
+def cmd_mv(dav, args) -> int:
+    if args.dry_run:
+        print(f"将移动 {args.src} → {args.dst}")
+        return EXIT_OK
+    dav.move(args.src, args.dst)
+    return EXIT_OK
+
+
+def cmd_cp(dav, args) -> int:
+    if args.dry_run:
+        print(f"将复制 {args.src} → {args.dst}")
+        return EXIT_OK
+    dav.copy(args.src, args.dst)
+    return EXIT_OK
+
+
+_QUOTA_BODY = (b'<?xml version="1.0" encoding="utf-8"?>'
+               b'<D:propfind xmlns:D="DAV:"><D:prop>'
+               b'<D:quota-available-bytes/><D:quota-used-bytes/>'
+               b'</D:prop></D:propfind>')
+
+
+def _quota_numbers(resp) -> tuple[int | None, int | None]:
+    avail = used = None
+    try:
+        root = ET.fromstring(resp.body)
+    except ET.ParseError as e:
+        raise NsdavError(f"配额响应不是合法 XML: {e}")
+    for el in root.iter():
+        tag = el.tag.rsplit("}", 1)[-1]
+        if not el.text or not el.text.strip().isdigit():
+            continue
+        if tag == "quota-available-bytes":
+            avail = int(el.text)
+        elif tag == "quota-used-bytes":
+            used = int(el.text)
+    return avail, used
+
+
+def cmd_quota(dav, args) -> int:
+    # propfind() 只回 Entry（不含 RFC 4331 的配额属性），这里要原始响应。
+    resp = dav._expect(dav.t.request(
+        "PROPFIND", dav.target("/"), body=_QUOTA_BODY,
+        headers={"Content-Type": 'application/xml; charset="utf-8"',
+                 "Depth": "0"}))
+    avail, used = _quota_numbers(resp)
+    if avail is None:
+        raise NsdavError(
+            "服务端不支持配额查询（PROPFIND 未返回 RFC 4331 的 "
+            "quota-available-bytes）")
+    if args.json:
+        print(json.dumps({"available": avail, "used": used},
+                         ensure_ascii=False, indent=2))
+    elif used is None:
+        print(f"可用 {format_size(avail)}")
+    else:
+        print(f"可用 {format_size(avail)}，已用 {format_size(used)}，"
+              f"合计 {format_size(avail + used)}")
+    return EXIT_OK
+
+
+_COMMANDS = {
+    "ls": cmd_ls, "stat": cmd_stat, "tree": cmd_tree, "cat": cmd_cat,
+    "get": cmd_get, "put": cmd_put, "mkdir": cmd_mkdir, "rm": cmd_rm,
+    "mv": cmd_mv, "cp": cmd_cp, "quota": cmd_quota,
+}
+
+
+def _dispatch(args, dav) -> int:
+    return _COMMANDS[args.cmd](dav, args)
+```
+
+命令实现与分发表就是上一段代码块，下表是逐条行为对照：
+
+（承 P5：`tree` 与 `quota` 这两条，实现者仍各补一条用例 —— 前者打印嵌套
+条目，后者在服务端不返回 RFC 4331 属性时明确报错而不是抛 traceback。）
 
 | 命令 | 行为 |
 |---|---|
