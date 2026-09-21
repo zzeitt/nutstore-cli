@@ -856,6 +856,9 @@ CONFIG_ENV_URL = "NSDAV_WEBDAV_URL"
 CONFIG_ENV_USER = "NSDAV_WEBDAV_USER"
 CONFIG_ENV_PASSWORD = "NSDAV_WEBDAV_PASSWORD"
 
+# 3.11 以下没有 tomllib：那时配置文件被忽略（会告警），只能靠环境变量/命令行。
+TOML_AVAILABLE = sys.version_info >= (3, 11)
+
 
 @dataclass
 class Config:
@@ -888,9 +891,13 @@ def _read_config_file(path: str | None = None) -> dict[str, str]:
         pass
     try:
         with open(path, "rb") as f:
-            if sys.version_info >= (3, 11):
-                import tomllib
-                return {k: str(v) for k, v in tomllib.load(f).items()}
+            if not TOML_AVAILABLE:
+                print(f"警告: 当前 Python 不支持 TOML（{sys.version.split()[0]}），"
+                      f"已忽略配置文件 {path}；请改用环境变量或命令行参数",
+                      file=sys.stderr)
+                return {}
+            import tomllib
+            return {k: str(v) for k, v in tomllib.load(f).items()}
     except Exception as e:
         print(f"警告: 读取 {path} 失败: {e}", file=sys.stderr)
     return {}
@@ -900,7 +907,11 @@ def _split_url(url: str) -> tuple[str, int | None, bool, str]:
     sp = urlsplit(url if "://" in url else "https://" + url)
     if not sp.hostname:
         raise UsageError(f"无法解析 WebDAV 地址: {url}")
-    return (sp.hostname, sp.port, sp.scheme != "http",
+    try:
+        port = sp.port
+    except ValueError as e:
+        raise UsageError(f"WebDAV 地址里的端口不合法: {url}") from e
+    return (sp.hostname, port, sp.scheme != "http",
             sp.path.rstrip("/") or DEFAULT_BASE)
 
 
@@ -937,18 +948,28 @@ def load_config(args, *, env=None, config=None) -> Config:
         host=host, port=port, use_tls=use_tls, base_path=base_path,
         user=user, password=password,
         min_gap=_number(pick(getattr(args, "min_gap", None), "NSDAV_MIN_GAP",
-                             "min_gap", DEFAULT_MIN_GAP), float, "min_gap"),
+                             "min_gap", DEFAULT_MIN_GAP), float, "min_gap",
+                        minimum=0.0),
         max_retries=_number(pick(getattr(args, "max_retries", None),
                                  "NSDAV_MAX_RETRIES", "max_retries",
-                                 DEFAULT_MAX_RETRIES), int, "max_retries"),
+                                 DEFAULT_MAX_RETRIES), int, "max_retries",
+                            minimum=0),
         timeout=_number(pick(getattr(args, "timeout", None), "NSDAV_TIMEOUT",
-                             "timeout", DEFAULT_TIMEOUT), float, "timeout"),
+                             "timeout", DEFAULT_TIMEOUT), float, "timeout",
+                        minimum=0.0, exclusive=True),
     )
 
 
-def _number(value, cast, name: str):
-    """配置文件里数值也是字符串，统一在这里转，并给出可读的报错。"""
+def _number(value, cast, name: str, *, minimum=None, exclusive=False):
+    """配置文件里数值也是字符串，统一在这里转，并给出可读的报错。
+
+    `minimum` 给出下限：默认"不能小于"，`exclusive=True` 时"必须大于"。
+    """
     try:
-        return cast(value)
+        n = cast(value)
     except (TypeError, ValueError) as e:
         raise UsageError(f"配置项 {name} 不是合法数值: {value!r}") from e
+    if minimum is not None and (n <= minimum if exclusive else n < minimum):
+        rel = "必须大于" if exclusive else "不能小于"
+        raise UsageError(f"配置项 {name} {rel} {minimum}: {value!r}")
+    return n
