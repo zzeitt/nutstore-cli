@@ -1790,7 +1790,7 @@ def test_status_retry_drops_the_connection(dav):
 
     只断言"最终 201"抓不到它：mock 会把 body 读干净，怎么重试都成功。所以数
     连接条数——503 之后的那次重试必须新建一条。删掉 `_drop_conn()` 这行，本用例
-    立刻红，而其余 9 条全绿（实测）。
+    立刻红，而其余 10 条全绿（实测）。
     """
     s, base = dav
     s.fail_first_n = 1
