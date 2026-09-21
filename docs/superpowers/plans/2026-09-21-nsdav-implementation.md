@@ -2342,13 +2342,38 @@ def test_download_small_file(dav, tmp_path):
 
 
 def test_download_chunked(dav, tmp_path):
+    """分块下载：51200 字节 / chunk=1024 必须是 50 次范围请求，每次正好 1024。
+
+    只断言内容对的话，一次 GET 拉完的实现照样绿——而"分块只为大文件省内存"
+    正是这个函数存在的理由（iSH 上内存比时间金贵）。所以这里直接钉住请求的
+    **形状**，不只是结果：50 次、每段 1024、首块从 0 开始。段长一律不超过
+    chunk 就等于说"任何时刻只持有一个 chunk 在内核之外"。
+    """
     s, base = dav
     d, t = _dav(s, base)
     payload = bytes(range(256)) * 200        # 51200 字节
     s.add_file("/big.bin", payload)
     dest = tmp_path / "big.bin"
+
+    ranges = []
+    real_stream = t.stream
+    def spy(method, target, **kw):
+        hdr = kw.get("headers") or {}
+        if "Range" in hdr:
+            ranges.append(hdr["Range"])
+        return real_stream(method, target, **kw)
+    t.stream = spy
+
     nsdav.download(d, "/big.bin", str(dest), chunk=1024, transport=t)
     assert dest.read_bytes() == payload
+
+    spans = []
+    for r in ranges:
+        lo, _, hi = r[len("bytes="):].partition("-")
+        spans.append(int(hi) - int(lo) + 1)
+    assert len(ranges) == 50, ranges
+    assert ranges[0] == "bytes=0-1023", ranges[:3]
+    assert all(sp == 1024 for sp in spans), spans
 
 
 def test_download_resumes_from_part(dav, tmp_path):
