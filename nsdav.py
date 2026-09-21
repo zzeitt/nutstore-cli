@@ -5,9 +5,13 @@
 """
 from __future__ import annotations
 
+import email.utils
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from urllib.parse import quote, urlsplit
+from datetime import timezone
+from typing import Any
+from urllib.parse import quote, unquote, urlsplit
 
 __version__ = "0.1.0"
 
@@ -173,3 +177,83 @@ def url_to_target(url: str) -> str:
     """
     sp = urlsplit(url)
     return sp.path + (("?" + sp.query) if sp.query else "")
+
+
+# ────────────────────────── PROPFIND 响应解析 ──────────────────────────
+
+def parse_http_date(value: str | None) -> float | None:
+    """解析 RFC 1123 日期（坚果云用的格式），失败返回 None。"""
+    if not value:
+        return None
+    try:
+        dt = email.utils.parsedate_to_datetime(value.strip())
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _status_is_ok(status_text: str | None) -> bool:
+    return bool(status_text) and " 200 " in f" {status_text.strip()} "
+
+
+def parse_multistatus(xml_bytes: bytes, base_path: str) -> list[Entry]:
+    """把 multistatus 响应解析成 Entry 列表。
+
+    base_path 是 WebDAV 根的路径前缀（如 '/dav'），解析出的 Entry.path
+    相对该前缀。响应里的 href 是百分号编码的，这里解码。
+    """
+    root = ET.fromstring(xml_bytes)
+    base = base_path.rstrip("/")
+    out: list[Entry] = []
+
+    for resp in root.findall(f"{DAV}response"):
+        href_el = resp.find(f"{DAV}href")
+        if href_el is None or not href_el.text:
+            continue
+        href = unquote(href_el.text.strip())
+
+        props: dict[str, Any] = {}
+        for ps in resp.findall(f"{DAV}propstat"):
+            if not _status_is_ok(ps.findtext(f"{DAV}status")):
+                continue
+            prop = ps.find(f"{DAV}prop")
+            if prop is None:
+                continue
+            for child in prop:
+                props[child.tag] = child
+
+        rtype = props.get(f"{DAV}resourcetype")
+        is_dir = rtype is not None and rtype.find(f"{DAV}collection") is not None
+
+        size_el = props.get(f"{DAV}getcontentlength")
+        size = 0
+        if size_el is not None and size_el.text and size_el.text.strip().isdigit():
+            size = int(size_el.text.strip())
+
+        mtime = parse_http_date(
+            props[f"{DAV}getlastmodified"].text
+            if f"{DAV}getlastmodified" in props else None
+        )
+
+        # 按整段边界比，不能用朴素前缀：base '/dav' 会匹配上 '/davos/x'。
+        # href 恰好等于 base（自身那一条）时 rel 落成 ""，下面的补 '/' 会接管。
+        if base and (href == base or href.startswith(base + "/")):
+            rel = href[len(base):]
+        else:
+            rel = href
+        if not rel.startswith("/"):
+            rel = "/" + rel
+        if is_dir:
+            if not rel.endswith("/"):
+                rel += "/"
+            name = rel.rstrip("/").rsplit("/", 1)[-1]
+        else:
+            name = rel.rsplit("/", 1)[-1]
+
+        out.append(Entry(path=rel, name=name, is_dir=is_dir,
+                         size=0 if is_dir else size, mtime=mtime))
+    return out
