@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import email.utils
 import http.client
+import os
 import random
 import re
 import sys
@@ -694,3 +695,83 @@ class WebDAV:
             "Destination": self._destination(dst),
             "Overwrite": "T" if overwrite else "F",
         }))
+
+
+# ─────────────────────────────── 下载 ───────────────────────────────
+
+def download(dav, remote_path, local_path, *, chunk=DOWNLOAD_CHUNK,
+             progress=None, transport=None) -> tuple[str, int]:
+    """把远端文件下到本地。
+
+    写 <目标>.part，全部就绪后原子改名。已有 .part 时断点续传。
+    返回 (本地路径, 字节数)。
+    """
+    entry = dav.stat(remote_path)
+    if entry.is_dir:
+        raise NsdavError(f"{remote_path} 是目录，不能下载")
+    total = entry.size
+    part = local_path + ".part"
+    t = transport or dav.t
+
+    def report(done):
+        if progress:
+            progress(done, total)
+
+    if total == 0:
+        with open(part, "wb"):
+            pass
+        os.replace(part, local_path)
+        report(0)
+        return local_path, 0
+
+    offset = 0
+    if os.path.exists(part):
+        have = os.path.getsize(part)
+        if have > total:
+            os.remove(part)              # 旧残留，重下
+        elif have == total:
+            os.replace(part, local_path)
+            return local_path, total
+        else:
+            offset = have
+
+    # 小文件一次拉完，分块只为大文件省内存
+    step = total if chunk <= 0 or total <= chunk else chunk
+
+    with open(part, "ab" if offset else "wb") as f:
+        while offset < total:
+            end = min(offset + step - 1, total - 1)
+            target = dav.target(remote_path)
+            with t.stream("GET", target,
+                          headers={"Range": f"bytes={offset}-{end}"}) as resp:
+                if resp.status == 200:
+                    # 服务端忽略 Range，从头返回：丢掉已有进度重来
+                    if offset:
+                        f.seek(0)
+                        f.truncate(0)
+                        offset = 0
+                    f.write(resp.body.read())
+                    break
+                if resp.status == 206:
+                    got = 0
+                    while True:
+                        buf = resp.body.read(65536)
+                        if not buf:
+                            break
+                        f.write(buf)
+                        got += len(buf)
+                    offset += got
+                    report(offset)
+                    if got == 0:
+                        raise NsdavError(
+                            f"下载中断：{remote_path} 在第 {offset} 字节处卡住")
+                    continue
+                raise NsdavError(
+                    f"下载 {remote_path} 失败：HTTP {resp.status}")
+
+    if os.path.getsize(part) != total:
+        raise NsdavError(
+            f"下载不完整：{remote_path} 期望 {total} 字节，"
+            f"实际 {os.path.getsize(part)} 字节。留下 {part} 以便续传。")
+    os.replace(part, local_path)
+    return local_path, total

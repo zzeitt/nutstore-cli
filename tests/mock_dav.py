@@ -18,6 +18,10 @@ class MockDAV:
         self._fail_first_n = fail_first_n
         self.fail_status = fail_status
         self.latency = latency
+        # 关掉 Range 支持：带 Range 的 GET 一律回 200 全量，模拟不支持范围
+        # 请求的服务器。T9 的续传必须能从这种回退里恢复（关键点之一，
+        # 但在此之前没有任何用例走到过那条分支）。
+        self.ignore_range = False
         self.user = user
         self.password = password
         self.store: dict[str, bytes] = {}
@@ -106,7 +110,7 @@ class MockDAV:
                     return
                 data = outer.store[rel]
                 rng = self.headers.get("Range")
-                if rng:
+                if rng and not outer.ignore_range:
                     m = re.match(r"bytes=(\d+)-(\d*)", rng)
                     if m:
                         start = int(m.group(1))

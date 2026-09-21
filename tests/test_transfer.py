@@ -1,0 +1,156 @@
+import os
+import pytest
+
+import nsdav
+from mock_dav import MockDAV
+
+
+@pytest.fixture
+def dav():
+    s = MockDAV(); base = s.start()
+    yield s, base
+    s.stop()
+
+
+def _dav(s, base, **kw):
+    from urllib.parse import urlsplit
+    u = urlsplit(base)
+    t = nsdav.Transport(u.hostname, port=u.port, use_tls=False,
+                        user="u", password="p", min_gap=0, rand=lambda: 0.5, **kw)
+    t._sleep = lambda _s: None
+    return nsdav.WebDAV(t), t
+
+
+def test_download_small_file(dav, tmp_path):
+    s, base = dav
+    d, t = _dav(s, base)
+    s.add_file("/a.bin", b"hello world")
+    dest = tmp_path / "a.bin"
+    path, n = nsdav.download(d, "/a.bin", str(dest), transport=t)
+    assert path == str(dest)
+    assert dest.read_bytes() == b"hello world"
+    assert n == 11
+    assert not os.path.exists(str(dest) + ".part")
+
+
+def test_download_chunked(dav, tmp_path):
+    """分块下载：51200 字节 / chunk=1024 必须是 50 次范围请求，每次正好 1024。
+
+    只断言内容对的话，一次 GET 拉完的实现照样绿——而"分块只为大文件省内存"
+    正是这个函数存在的理由（iSH 上内存比时间金贵）。所以这里直接钉住请求的
+    **形状**，不只是结果：50 次、每段 1024、首块从 0 开始。段长一律不超过
+    chunk 就等于说"任何时刻只持有一个 chunk 在内核之外"。
+    """
+    s, base = dav
+    d, t = _dav(s, base)
+    payload = bytes(range(256)) * 200        # 51200 字节
+    s.add_file("/big.bin", payload)
+    dest = tmp_path / "big.bin"
+
+    ranges = []
+    real_stream = t.stream
+    def spy(method, target, **kw):
+        hdr = kw.get("headers") or {}
+        if "Range" in hdr:
+            ranges.append(hdr["Range"])
+        return real_stream(method, target, **kw)
+    t.stream = spy
+
+    nsdav.download(d, "/big.bin", str(dest), chunk=1024, transport=t)
+    assert dest.read_bytes() == payload
+
+    spans = []
+    for r in ranges:
+        lo, _, hi = r[len("bytes="):].partition("-")
+        spans.append(int(hi) - int(lo) + 1)
+    assert len(ranges) == 50, ranges
+    assert ranges[0] == "bytes=0-1023", ranges[:3]
+    assert all(sp == 1024 for sp in spans), spans
+
+
+def test_download_resumes_from_part(dav, tmp_path):
+    s, base = dav
+    d, t = _dav(s, base)
+    payload = bytes(range(256)) * 200        # 51200 字节
+    s.add_file("/big.bin", payload)
+    dest = tmp_path / "big.bin"
+    part = str(dest) + ".part"
+    with open(part, "wb") as f:              # 假装上次下了一半
+        f.write(payload[:20000])
+
+    ranges = []
+    real_stream = t.stream
+    def spy(method, target, **kw):
+        hdr = kw.get("headers") or {}
+        if "Range" in hdr:
+            ranges.append(hdr["Range"])
+        return real_stream(method, target, **kw)
+    t.stream = spy
+
+    nsdav.download(d, "/big.bin", str(dest), chunk=8192, transport=t)
+    assert dest.read_bytes() == payload
+    # 必须从断点开始，不能重下已经拿到的 20000 字节
+    assert ranges[0] == "bytes=20000-28191"
+
+
+def test_download_restarts_when_server_ignores_range(dav, tmp_path):
+    """服务端不支持 Range（对范围请求回 200 全量）时必须丢掉断点重下。
+
+    这条是上面关键点里明写的分支，此前一条用例都覆盖不到：mock 永远支持
+    Range，这段代码从没被走到过。所以先把 mock 的 Range 支持关掉，再喂一个
+    **长度对得上、内容全错**的残留 .part —— 只断"最终内容对"是不够的，若残留
+    长度凑巧吻合，一个把 200 的全量直接追加到已有 .part 后面的实现也能蒙混
+    过去。所以断言两层：内容，以及"只发过一次范围请求"这个形状（先照常试探
+    续传，被 200 顶回来才发现不支持，不能连试都不试）。
+    """
+    s, base = dav
+    d, t = _dav(s, base)
+    payload = bytes(range(256)) * 200        # 51200 字节
+    s.add_file("/big.bin", payload)
+    s.ignore_range = True
+    dest = tmp_path / "big.bin"
+    with open(str(dest) + ".part", "wb") as f:
+        f.write(b"X" * 20000)                # 长度对得上，内容全错
+
+    ranges = []
+    real_stream = t.stream
+    def spy(method, target, **kw):
+        hdr = kw.get("headers") or {}
+        if "Range" in hdr:
+            ranges.append(hdr["Range"])
+        return real_stream(method, target, **kw)
+    t.stream = spy
+
+    # chunk 显式给，且大于文件：逼出"一次拉完"的路径，不依赖 DOWNLOAD_CHUNK 默认值
+    nsdav.download(d, "/big.bin", str(dest), chunk=1 << 20, transport=t)
+    assert dest.read_bytes() == payload
+    assert ranges == ["bytes=20000-51199"], ranges
+
+
+def test_stale_part_larger_than_remote_is_discarded(dav, tmp_path):
+    s, base = dav
+    d, t = _dav(s, base)
+    s.add_file("/small.bin", b"tiny")
+    dest = tmp_path / "small.bin"
+    with open(str(dest) + ".part", "wb") as f:
+        f.write(b"x" * 9999)
+    nsdav.download(d, "/small.bin", str(dest), transport=t)
+    assert dest.read_bytes() == b"tiny"
+
+
+def test_empty_file_download(dav, tmp_path):
+    s, base = dav
+    d, t = _dav(s, base)
+    s.add_file("/empty.bin", b"")
+    dest = tmp_path / "empty.bin"
+    nsdav.download(d, "/empty.bin", str(dest), transport=t)
+    assert dest.exists() and dest.read_bytes() == b""
+
+
+def test_no_part_file_left_on_success(dav, tmp_path):
+    s, base = dav
+    d, t = _dav(s, base)
+    s.add_file("/x.bin", b"abc")
+    dest = tmp_path / "x.bin"
+    nsdav.download(d, "/x.bin", str(dest), transport=t)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["x.bin"]
