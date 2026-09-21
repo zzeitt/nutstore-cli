@@ -2402,6 +2402,7 @@ git commit -m "feat(webdav): 操作层，含分页跟随与自动建父目录"
 
 **Files:**
 - Modify: `nsdav.py`
+- Modify: `tests/mock_dav.py`（加 `ignore_range` 开关，见 Step 1）
 - Test: `tests/test_transfer.py`
 
 **Interfaces:**
@@ -2414,7 +2415,28 @@ git commit -m "feat(webdav): 操作层，含分页跟随与自动建父目录"
 - 已有 `.part` 时从断点续；`.part` 比远端大则说明是旧残留，删掉重下。
 - 服务端对 Range 请求返回 `200`（而非 `206`）时，说明不支持 Range，必须从头来。
 
+**关于 import（承 P6）：** 本节的代码块从分节注释开始，不含 import。按 P6，本节
+实现者自己补 `import os`（`nsdav.py` 顶部，`import http.client` 之后）—— 漏了它，
+`download` 里四处 `os.path.*`/`os.replace` 全是 `NameError`（实测：整份测试 7 条全红）。
+
 - [ ] **Step 1: 写失败的测试**
+
+先给 `tests/mock_dav.py` 加一个按请求现读的开关，让 T9 能走到"服务端不支持
+Range"那条分支 —— 不然那条分支的用例是空转的（mock 永远回 206，一个"把 200
+的全量直接追加到已有 .part 后面"的实现也能让用例绿）：
+
+```python
+# MockDAV.__init__，紧跟 self.latency = latency 之后：
+        # 关掉 Range 支持：带 Range 的 GET 一律回 200 全量，模拟不支持范围
+        # 请求的服务器。T9 的续传必须能从这种回退里恢复（关键点之一，
+        # 但在此之前没有任何用例走到过那条分支）。
+        self.ignore_range = False
+
+# Handler._do_get 里，把 `if rng:` 改成：
+                if rng and not outer.ignore_range:
+```
+
+`tests/test_transfer.py`：
 
 `tests/test_transfer.py`：
 
@@ -2512,6 +2534,40 @@ def test_download_resumes_from_part(dav, tmp_path):
     assert dest.read_bytes() == payload
     # 必须从断点开始，不能重下已经拿到的 20000 字节
     assert ranges[0] == "bytes=20000-28191"
+
+
+def test_download_restarts_when_server_ignores_range(dav, tmp_path):
+    """服务端不支持 Range（对范围请求回 200 全量）时必须丢掉断点重下。
+
+    这条是上面关键点里明写的分支，此前一条用例都覆盖不到：mock 永远支持
+    Range，这段代码从没被走到过。所以先把 mock 的 Range 支持关掉，再喂一个
+    **长度对得上、内容全错**的残留 .part —— 只断"最终内容对"是不够的，若残留
+    长度凑巧吻合，一个把 200 的全量直接追加到已有 .part 后面的实现也能蒙混
+    过去。所以断言两层：内容，以及"只发过一次范围请求"这个形状（先照常试探
+    续传，被 200 顶回来才发现不支持，不能连试都不试）。
+    """
+    s, base = dav
+    d, t = _dav(s, base)
+    payload = bytes(range(256)) * 200        # 51200 字节
+    s.add_file("/big.bin", payload)
+    s.ignore_range = True
+    dest = tmp_path / "big.bin"
+    with open(str(dest) + ".part", "wb") as f:
+        f.write(b"X" * 20000)                # 长度对得上，内容全错
+
+    ranges = []
+    real_stream = t.stream
+    def spy(method, target, **kw):
+        hdr = kw.get("headers") or {}
+        if "Range" in hdr:
+            ranges.append(hdr["Range"])
+        return real_stream(method, target, **kw)
+    t.stream = spy
+
+    # chunk 显式给，且大于文件：逼出"一次拉完"的路径，不依赖 DOWNLOAD_CHUNK 默认值
+    nsdav.download(d, "/big.bin", str(dest), chunk=1 << 20, transport=t)
+    assert dest.read_bytes() == payload
+    assert ranges == ["bytes=20000-51199"], ranges
 
 
 def test_stale_part_larger_than_remote_is_discarded(dav, tmp_path):
