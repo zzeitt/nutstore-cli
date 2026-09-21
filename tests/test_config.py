@@ -201,17 +201,34 @@ def test_bad_port_is_usage_error_not_valueerror(bad):
         nsdav.load_config(Args(url=bad), env={}, config={})
 
 
-@pytest.mark.parametrize("key,value", [
-    ("NSDAV_MIN_GAP", "-1"),
-    ("NSDAV_MAX_RETRIES", "-1"),
-    ("NSDAV_TIMEOUT", "0"),
-    ("NSDAV_TIMEOUT", "-5"),
-])
-def test_out_of_range_numbers_are_usage_errors(key, value):
-    """三个旋钮的下限：min_gap/max_retries 不能小于 0，timeout 必须大于 0。"""
-    env = {"NSDAV_WEBDAV_USER": "u", "NSDAV_WEBDAV_PASSWORD": "p", key: value}
+_RANGE_CASES = [
+    # (env 键, config 键, Args 键, 文本值, 命令行值)
+    ("NSDAV_MIN_GAP", "min_gap", "min_gap", "-1", -1.0),
+    ("NSDAV_MAX_RETRIES", "max_retries", "max_retries", "-1", -1),
+    ("NSDAV_TIMEOUT", "timeout", "timeout", "0", 0.0),
+    ("NSDAV_TIMEOUT", "timeout", "timeout", "-5", -5.0),
+]
+
+_CRED = {"NSDAV_WEBDAV_USER": "u", "NSDAV_WEBDAV_PASSWORD": "p"}
+
+
+@pytest.mark.parametrize("source", ["cli", "env", "config"])
+@pytest.mark.parametrize("env_key,cfg_key,arg_key,text,cli_value", _RANGE_CASES)
+def test_out_of_range_numbers_are_usage_errors(
+        source, env_key, cfg_key, arg_key, text, cli_value):
+    """越界值从三个来源进来都要报 UsageError。
+
+    校验是单点收口（`pick` → `_number`），这条用例按来源参数化就是钉住"单点"这件事：
+    任何"某个来源跳过校验"的实现都会在这里红。
+    """
+    if source == "cli":
+        args, env, cfg = Args(**{arg_key: cli_value}), _CRED, {}
+    elif source == "env":
+        args, env, cfg = Args(), dict(_CRED, **{env_key: text}), {}
+    else:
+        args, env, cfg = Args(), _CRED, {cfg_key: text}
     with pytest.raises(nsdav.UsageError):
-        nsdav.load_config(Args(), env=env, config={})
+        nsdav.load_config(args, env=env, config=cfg)
 
 
 def test_version_gate_warns_and_ignores_config(tmp_path, monkeypatch, capsys):
@@ -231,3 +248,20 @@ def test_config_file_path_falls_back_to_dot_config(monkeypatch):
     # 分隔符交给 os.path.join：本仓库在 Windows 上跑，硬编 "/" 会红。
     assert nsdav.config_file_path() == os.path.join(
         "/fake/home", ".config", "nsdav", "config.toml")
+
+
+# ── 修复轮 2：范围化复审提出的洞 ──
+
+@pytest.mark.parametrize("bad", ["inf", "-inf", "nan"])
+def test_non_finite_numbers_are_usage_errors(bad):
+    """inf / nan 能穿过上下限比较，必须在入口就被拒（否则 settimeout 处 traceback）。"""
+    env = dict(_CRED, **{"NSDAV_TIMEOUT": bad})
+    with pytest.raises(nsdav.UsageError):
+        nsdav.load_config(Args(), env=env, config={})
+
+
+@pytest.mark.parametrize("bad", ["https://", "http:///dav"])
+def test_url_without_host_is_usage_error(bad):
+    """解析不出主机名要报 UsageError（exit 2），不是让 None 流进 Transport。"""
+    with pytest.raises(nsdav.UsageError):
+        nsdav.load_config(Args(url=bad), env={}, config={})

@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import email.utils
 import http.client
+import math
 import os
 import random
 import re
@@ -964,11 +965,15 @@ def _number(value, cast, name: str, *, minimum=None, exclusive=False):
     """配置文件里数值也是字符串，统一在这里转，并给出可读的报错。
 
     `minimum` 给出下限：默认"不能小于"，`exclusive=True` 时"必须大于"。
+    inf / nan 这样的非有限值一律拒绝 —— 它们能穿过上下限比较，最后在
+    `socket.settimeout` 那里变成 OverflowError / ValueError。
     """
     try:
         n = cast(value)
     except (TypeError, ValueError) as e:
         raise UsageError(f"配置项 {name} 不是合法数值: {value!r}") from e
+    if isinstance(n, float) and not math.isfinite(n):
+        raise UsageError(f"配置项 {name} 必须是有限数值: {value!r}")
     if minimum is not None and (n <= minimum if exclusive else n < minimum):
         rel = "必须大于" if exclusive else "不能小于"
         raise UsageError(f"配置项 {name} {rel} {minimum}: {value!r}")
