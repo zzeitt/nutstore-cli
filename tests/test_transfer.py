@@ -241,7 +241,9 @@ class _ConnSpy:
 
 
 def test_stream_drain_on_failure_is_bounded(dav):
-    """离开 `with` 时要把剩余响应体读干净（连接才能复用），但必须按块读。
+    """离开 `with` 时要把剩余响应体读干净（连接才能复用），但必须按块读 ——
+    断言 drain 真的读到了 EOF（`sum(sizes)` 逼近整个 body，不是只有用例自己
+    那 1024），且每一次 read 都带正数长度、不超过 64 KiB。
 
     成功路径看不出问题：两条下载循环都读到了 EOF，drain 读到空串。**中途失败**
     才看得见 —— 磁盘写满（ENOSPC，`.part`/续传存在的理由）、进度回调抛异常、
@@ -267,6 +269,8 @@ def test_stream_drain_on_failure_is_bounded(dav):
 
     sizes = [n for r in sink for n in r.sizes]
     assert sizes, "一次 read 都没有？"
+    # drain 必须真的把剩下的读完 —— 少了它，sizes 里只剩用例自己那 1024。
+    assert sum(sizes) >= len(payload) - 65536, sizes
     assert all(isinstance(n, int) and 0 < n <= 65536 for n in sizes), sizes
 
 
