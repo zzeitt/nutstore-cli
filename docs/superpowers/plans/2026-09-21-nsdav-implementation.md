@@ -3346,11 +3346,29 @@ def test_06_special_characters_roundtrip(dav, tmp_path):
     assert name in [e.name for e in dav.listdir(TEST_DIR)]
 
 
-def test_07_pagination_over_750(dav):
-    """建 760 个文件触发分页，确认不丢条目。这条最慢，放最后。"""
+def test_07_pagination_over_750_in_special_directory(dav):
+    """分页 + 特殊字符目录名。这条最慢，放最后。
+
+    **目录名故意带空格和中文**，不是装饰。分页 URL 的编码形式是 T6 的 P35 留
+    下的悬案：mock 修好之前发的是解码后的 rel（裸空格 → http.client.InvalidURL；
+    中文目录名 → send_header 抛 UnicodeEncodeError，客户端只见 RemoteDisconnected
+    且拿不到 Link 头），而**真实服务器发什么形状一直没人看过**。只看 ASCII
+    名字分页抓不住这件事——编码函数对 ASCII 是恒等的，路径里没有需要编码的
+    字符，服务器给什么形状都"能用"。
+
+    两个症状都只在"分页 + 特殊字符"这个组合下出现，所以这条必须同时具备两者。
+    ASCII 的通用分页由 mock 层的 test_listdir_follows_pagination 覆盖，分工不重
+    叠：那边证明客户端逻辑，这边证明真实服务器的 Link 客户端吃得下。
+
+    断言的是**客户端属性**（能不能把 760 条都取回来），不是服务器的字节形状：
+    服务器真要是发了双编码的 Link，这条会以"取不满"或直接抛错失败，那才是我们
+    要立刻知道的事；把 Link 的具体字节焊进断言则会在服务器无害改版时误报。
+    """
+    sub = f"{TEST_DIR}/分页 目录"
+    dav.mkdirs(sub)
     for i in range(760):
-        dav.put(f"{TEST_DIR}/p-{i:04d}.txt", b"x")
-    names = [e.name for e in dav.listdir(TEST_DIR)]
+        dav.put(f"{sub}/p-{i:04d}.txt", b"x")
+    names = [e.name for e in dav.listdir(sub)]
     paged = [n for n in names if n.startswith("p-")]
     assert len(paged) == 760
 
