@@ -15,7 +15,7 @@ class MockDAV:
     def __init__(self, *, page_size=None, fail_first_n=0, fail_status=503,
                  latency=0.0, user="u", password="p"):
         self.page_size = page_size
-        self.fail_first_n = fail_first_n
+        self._fail_first_n = fail_first_n
         self.fail_status = fail_status
         self.latency = latency
         self.user = user
@@ -26,6 +26,21 @@ class MockDAV:
         self._failures_left = fail_first_n
         self._srv = None
         self._thread = None
+
+    # `fail_status`、`page_size`、`latency` 都是每次请求现读的，只有这一个
+    # 在 __init__ 里被抄进 _failures_left。于是 `start()` 之后再写
+    # `s.fail_first_n = 1`（Task 7 的 test_stream_body_retry_reopens_file
+    # 就是这么写的）被静默忽略：不注入 503，那条用例首次请求就成功，
+    # 永远不会碰到它名字里那个重试——StreamBody 重试时重开文件这件事
+    # 也就没人看。做成属性，设值时一并重置计数器。
+    @property
+    def fail_first_n(self):
+        return self._fail_first_n
+
+    @fail_first_n.setter
+    def fail_first_n(self, n):
+        self._fail_first_n = n
+        self._failures_left = n
 
     # ── 生命周期 ──
     def start(self) -> str:
@@ -113,6 +128,15 @@ class MockDAV:
 
             def _do_put(self, body):
                 rel = self._rel()
+                # 父集合不存在时必须 409（RFC 4918）。无条件回 201 的话，
+                # WebDAV.put 里"撞 409 → mkdirs → 重试"那段永远走不到，
+                # 而且 mock 会造出真实服务器不可能有的状态：这个文件 GET 得到，
+                # 却不出现在任何一次列表里。真实服务器就是这里回 409，
+                # put 的补建逻辑正是照它写的。
+                parent = rel.rstrip("/").rsplit("/", 1)[0] or "/"
+                if parent not in outer.dirs:
+                    self._simple(409)
+                    return
                 existed = rel in outer.store
                 outer.store[rel] = body
                 self._simple(204 if existed else 201)
@@ -219,8 +243,14 @@ class MockDAV:
                 if outer.page_size and len(items) > outer.page_size:
                     page = items[:outer.page_size]
                     last = page[-1][0]
+                    # 路径要和 href 用同一套编码。`rel` 是解码后的形式，直接拼进去
+                    # 会发出一个带裸空格的非法 URI；中文目录名更糟——send_header
+                    # 会抛 UnicodeEncodeError，客户端只看到 RemoteDisconnected。
+                    # 而且真实服务器给的本来就是编码过的分页 URL，mock 若只发这一种
+                    # 形式，客户端就只能自己再编一遍，正好落进本项目禁止的双编码。
+                    href = BASE_PATH + quote(rel, safe="/")
                     link = (f"<http://{self.headers.get('Host', '127.0.0.1')}"
-                            f"{BASE_PATH}{rel}?mk=" + quote(last, safe="") +
+                            f"{href}?mk=" + quote(last, safe="") +
                             '>; rel="next"')
                     items = page
 
