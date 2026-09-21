@@ -5,14 +5,18 @@
 """
 from __future__ import annotations
 
+import base64
 import email.utils
+import http.client
 import random
 import re
+import sys
 import time
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timezone
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable, Iterator, NamedTuple
 from urllib.parse import quote, unquote, urlsplit
 
 __version__ = "0.1.0"
@@ -326,3 +330,197 @@ class RateLimiter:
             if delta < self.min_gap:
                 self._sleep(self.min_gap - delta)
         self._last = self._clock()
+
+
+# ───────────────────────────── Transport ─────────────────────────────
+
+class Response(NamedTuple):
+    status: int
+    headers: dict[str, str]
+    body: bytes
+
+
+@dataclass
+class StreamBody:
+    """可重放的请求体。重试时必须重新调用 factory，否则第二次发出空 body。"""
+    factory: Callable[[], BinaryIO]
+    length: int
+
+
+class Transport:
+    """HTTP 传输层。不知道 WebDAV 的存在。
+
+    target 参数必须是【已经编码好的最终形式】。本层不做任何路径编码 ——
+    用户路径由 WebDAV 层经 enc_path 处理后传入，分页 URL 由 url_to_target
+    处理后传入，两者在此汇合。
+    """
+
+    def __init__(
+        self,
+        host: str,
+        *,
+        port: int | None = None,
+        use_tls: bool = True,
+        user: str,
+        password: str,
+        ua: str = NS_UA,
+        base_path: str = DEFAULT_BASE,
+        min_gap: float = DEFAULT_MIN_GAP,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        timeout: float = DEFAULT_TIMEOUT,
+        verbose: bool = False,
+        limiter: RateLimiter | None = None,
+        rand: Callable[[], float] = random.random,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.use_tls = use_tls
+        self.base_path = base_path.rstrip("/") or ""
+        self.ua = ua
+        self.max_retries = max_retries
+        self.timeout = timeout
+        self.verbose = verbose
+        self.limiter = limiter or RateLimiter(min_gap)
+        self._rand = rand
+        self._sleep = time.sleep
+        self._conn: http.client.HTTPConnection | None = None
+        token = base64.b64encode(f"{user}:{password}".encode()).decode()
+        self._auth = f"Basic {token}"
+
+    # ── 连接管理 ──
+
+    def _new_conn(self) -> http.client.HTTPConnection:
+        if self.use_tls:
+            return http.client.HTTPSConnection(
+                self.host, self.port, timeout=self.timeout)
+        return http.client.HTTPConnection(
+            self.host, self.port, timeout=self.timeout)
+
+    def _get_conn(self) -> http.client.HTTPConnection:
+        if self._conn is None:
+            self._conn = self._new_conn()
+        return self._conn
+
+    def _drop_conn(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def close(self) -> None:
+        self._drop_conn()
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"  · {msg}", file=sys.stderr)
+
+    # ── 头部 ──
+
+    def _headers(self, extra, depth) -> dict[str, str]:
+        h = {"Authorization": self._auth, "User-Agent": self.ua}
+        if depth is not None:
+            h["Depth"] = depth
+        if extra:
+            h.update(extra)
+        return h
+
+    # ── 重试循环 ──
+
+    def _attempt(self, method, target, body, headers):
+        """发一次请求。返回 (Response, None) 或 (None, 异常)。"""
+        try:
+            conn = self._get_conn()
+            stream = None
+            if isinstance(body, StreamBody):
+                stream = body.factory()
+            try:
+                conn.request(method, target, body=stream if stream else body,
+                             headers=headers)
+                r = conn.getresponse()
+                data = r.read()
+            finally:
+                if stream is not None:
+                    stream.close()
+            resp = Response(
+                r.status,
+                {k.lower(): v for k, v in r.getheaders()},
+                data,
+            )
+            return resp, None
+        except (http.client.HTTPException, OSError) as e:
+            self._drop_conn()
+            return None, e
+
+    def _body_headers(self, headers, body):
+        h = dict(headers)
+        if isinstance(body, StreamBody):
+            h["Content-Length"] = str(body.length)
+        return h
+
+    def request(self, method, target, *, body=None, headers=None,
+                depth=None) -> Response:
+        hdrs = self._body_headers(self._headers(headers, depth), body)
+        attempt = 0
+        while True:
+            attempt += 1
+            self.limiter.wait()
+            resp, exc = self._attempt(method, target, body, hdrs)
+
+            if exc is not None:
+                if attempt > self.max_retries:
+                    raise NetworkError(
+                        f"{method} {target} 失败: {exc}") from exc
+                d = backoff_delay(attempt, None, rand=self._rand)
+                self._log(f"连接错误({exc})，{d:.1f}s 后重试 "
+                          f"{attempt}/{self.max_retries}")
+                self._sleep(d)
+                continue
+
+            if resp.status in RETRYABLE_STATUS and attempt <= self.max_retries:
+                d = backoff_delay(attempt, resp.status, rand=self._rand)
+                self._log(f"HTTP {resp.status}，{d:.1f}s 后重试 "
+                          f"{attempt}/{self.max_retries}")
+                self._sleep(d)
+                continue
+            return resp
+
+    @contextmanager
+    def stream(self, method, target, *, headers=None, depth=None):
+        """流式读响应体。不做重试 —— 分块下载由上层负责续传。"""
+        self.limiter.wait()
+        conn = self._get_conn()
+        hdrs = self._headers(headers, depth)
+        try:
+            conn.request(method, target, headers=hdrs)
+            r = conn.getresponse()
+        except (http.client.HTTPException, OSError) as e:
+            self._drop_conn()
+            raise NetworkError(f"{method} {target} 失败: {e}") from e
+        try:
+            yield Response(r.status,
+                           {k.lower(): v for k, v in r.getheaders()},
+                           r)          # type: ignore[arg-type]
+        finally:
+            try:
+                r.read()            # 读完，连接才能复用
+            except Exception:
+                self._drop_conn()
+
+    # ── 状态码归一 ──
+
+    @staticmethod
+    def raise_for_status_or_raise(resp: Response) -> Response:
+        if resp.status < 400:
+            return resp
+        snippet = resp.body[:200].decode("utf-8", "replace")
+        if resp.status == 401:
+            raise AuthError(f"认证失败 (401)。请检查账号与应用密码。{snippet}")
+        if resp.status == 403:
+            raise NsdavError(f"没有权限 (403)。{snippet}")
+        if resp.status in (404, 410):
+            raise NotFoundError(f"路径不存在 ({resp.status})。{snippet}")
+        if resp.status == 429:
+            raise RateLimitError(f"被限流 (429)。调大 --min-gap 重试。{snippet}")
+        raise NsdavError(f"HTTP {resp.status}。{snippet}")
