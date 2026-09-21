@@ -5,9 +5,11 @@
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import email.utils
 import http.client
+import json
 import math
 import os
 import random
@@ -978,3 +980,305 @@ def _number(value, cast, name: str, *, minimum=None, exclusive=False):
         rel = "必须大于" if exclusive else "不能小于"
         raise UsageError(f"配置项 {name} {rel} {minimum}: {value!r}")
     return n
+
+
+# ────────────────────────────── 命令行层 ──────────────────────────────
+
+def format_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        n /= 1024.0
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+    return f"{n:.1f} PiB"
+
+
+def _entry_dict(e: Entry) -> dict[str, Any]:
+    return {"path": e.path, "name": e.name, "is_dir": e.is_dir,
+            "size": e.size, "mtime": e.mtime}
+
+
+def _print_entries(entries, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps([_entry_dict(e) for e in entries],
+                         ensure_ascii=False, indent=2))
+        return
+    for e in entries:
+        if e.is_dir:
+            print(f"  {'<dir>':>10}  {e.name}/")
+        else:
+            print(f"  {format_size(e.size):>10}  {e.name}")
+
+
+def _make_dav(cfg: Config) -> WebDAV:
+    t = Transport(cfg.host, port=cfg.port, use_tls=cfg.use_tls,
+                  user=cfg.user, password=cfg.password,
+                  base_path=cfg.base_path, min_gap=cfg.min_gap,
+                  max_retries=cfg.max_retries, timeout=cfg.timeout,
+                  verbose=cfg_verbose())
+    return WebDAV(t, base_path=cfg.base_path)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="nsdav", description="坚果云 WebDAV 命令行工具")
+    p.add_argument("--version", action="version", version=__version__)
+    p.add_argument("--json", action="store_true", help="以 JSON 输出")
+    p.add_argument("-v", "--verbose", action="store_true", help="打印请求日志")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="只显示要做什么")
+    p.add_argument("--url")
+    p.add_argument("--user")
+    p.add_argument("--password")
+    p.add_argument("--min-gap", type=float)
+    p.add_argument("--max-retries", type=int)
+    p.add_argument("--timeout", type=float)
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("ls").add_argument("path", nargs="?", default="/")
+    sub.add_parser("stat").add_argument("path")
+    tp = sub.add_parser("tree")
+    tp.add_argument("path", nargs="?", default="/")
+    tp.add_argument("-d", "--depth", type=int, default=3)
+    sub.add_parser("cat").add_argument("path")
+    g = sub.add_parser("get")
+    g.add_argument("remote"); g.add_argument("local", nargs="?")
+    u = sub.add_parser("put")
+    u.add_argument("local"); u.add_argument("remote", nargs="?")
+    u.add_argument("--verify", choices=("size", "strong"), default="size")
+    m = sub.add_parser("mkdir"); m.add_argument("path")
+    m.add_argument("-p", "--parents", action="store_true")
+    r = sub.add_parser("rm"); r.add_argument("path")
+    r.add_argument("-r", "--recursive", action="store_true")
+    r.add_argument("-y", "--yes", action="store_true")
+    mv = sub.add_parser("mv"); mv.add_argument("src"); mv.add_argument("dst")
+    cp = sub.add_parser("cp"); cp.add_argument("src"); cp.add_argument("dst")
+    sub.add_parser("quota")
+    return p
+
+
+_VERBOSE = False
+
+
+def cfg_verbose() -> bool:
+    return _VERBOSE
+
+
+# ── 命令分发 ──
+
+def _progress(done: int, total: int | None) -> None:
+    """下载进度写 stderr —— stdout 留给数据与 --json。"""
+    if not total:
+        return
+    sys.stderr.write(f"\r  {format_size(done)} / {format_size(total)}"
+                     f"  ({done * 100.0 / total:5.1f}%)")
+    if done >= total:
+        sys.stderr.write("\n")
+
+
+def _confirm(prompt: str) -> bool:
+    try:
+        return input(prompt).strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def _print_entry(e: Entry, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(_entry_dict(e), ensure_ascii=False, indent=2))
+    elif e.is_dir:
+        print(f"{e.path}/")
+    else:
+        print(f"{e.path}  {format_size(e.size)}")
+
+
+def cmd_ls(dav, args) -> int:
+    _print_entries(dav.listdir(args.path), args.json)
+    return EXIT_OK
+
+
+def cmd_stat(dav, args) -> int:
+    _print_entry(dav.stat(args.path), args.json)
+    return EXIT_OK
+
+
+def cmd_tree(dav, args) -> int:
+    root = normalize_remote_path(args.path)
+    root_segs = len([s for s in root.split("/") if s])
+    if args.json:
+        _print_entries(list(dav.walk(root, max_depth=args.depth)), True)
+        return EXIT_OK
+    print(root)
+    for e in dav.walk(root, max_depth=args.depth):
+        segs = len([s for s in e.path.rstrip("/").split("/") if s])
+        indent = "  " * max(segs - root_segs - 1, 0)
+        print(f"{indent}{e.name}{'/' if e.is_dir else ''}")
+    return EXIT_OK
+
+
+def cmd_cat(dav, args) -> int:
+    sys.stdout.buffer.write(dav.read(args.path))
+    sys.stdout.buffer.flush()
+    return EXIT_OK
+
+
+def cmd_get(dav, args) -> int:
+    remote = normalize_remote_path(args.remote)
+    local = args.local or os.path.basename(remote.rstrip("/")) or "download"
+    if args.dry_run:
+        print(f"将下载 {remote} → {local}")
+        return EXIT_OK
+    path, n = download(dav, remote, local, transport=dav.t,
+                       progress=None if args.quiet else _progress)
+    if not args.quiet:
+        print(f"已下载 {format_size(n)} → {path}", file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_put(dav, args) -> int:
+    remote = normalize_remote_path(
+        args.remote or "/" + os.path.basename(args.local))
+    if args.dry_run:
+        print(f"将上传 {args.local} → {remote}")
+        return EXIT_OK
+    n = upload(dav, args.local, remote, verify=args.verify)
+    if not args.quiet:
+        print(f"已上传 {format_size(n)} → {remote}", file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_mkdir(dav, args) -> int:
+    if args.dry_run:
+        print(f"将创建 {args.path}")
+        return EXIT_OK
+    if args.parents:
+        dav.mkdirs(args.path)
+    else:
+        dav.mkcol(args.path)
+    return EXIT_OK
+
+
+def cmd_rm(dav, args) -> int:
+    target = normalize_remote_path(args.path)
+    if not (args.recursive and dav.stat(target).is_dir):
+        if args.dry_run:
+            print(f"将删除 {target}")
+            return EXIT_OK
+        dav.delete(target)              # 目录且非递归时 T8 的守卫会拒绝
+        return EXIT_OK
+
+    # 递归删整棵树就是**一个** DELETE：RFC 4918 §9.6.1 规定对集合缺省
+    # Depth: infinity。别自己拆成逐个删 —— walk 是 BFS、父在子前，删掉父目录
+    # 之后子项已不存在，两层以上必然 404（实测：三层时退出码 4，而 T12 原有
+    # 用例只嵌一层，看不到）。列出来只为确认提示与 --dry-run。
+    doomed = [target] + [e.path for e in dav.walk(target)]
+    if args.dry_run:
+        for p in doomed:
+            print(f"将删除 {p}")
+        return EXIT_OK
+    if not args.yes:
+        for p in doomed:
+            print(p)
+        if not _confirm(f"以上 {len(doomed)} 项将被递归删除，确认？[y/N] "):
+            print("已取消", file=sys.stderr)
+            return EXIT_ERROR
+    dav.delete(target, recursive=True)
+    return EXIT_OK
+
+
+def cmd_mv(dav, args) -> int:
+    if args.dry_run:
+        print(f"将移动 {args.src} → {args.dst}")
+        return EXIT_OK
+    dav.move(args.src, args.dst)
+    return EXIT_OK
+
+
+def cmd_cp(dav, args) -> int:
+    if args.dry_run:
+        print(f"将复制 {args.src} → {args.dst}")
+        return EXIT_OK
+    dav.copy(args.src, args.dst)
+    return EXIT_OK
+
+
+_QUOTA_BODY = (b'<?xml version="1.0" encoding="utf-8"?>'
+               b'<D:propfind xmlns:D="DAV:"><D:prop>'
+               b'<D:quota-available-bytes/><D:quota-used-bytes/>'
+               b'</D:prop></D:propfind>')
+
+
+def _quota_numbers(resp) -> tuple[int | None, int | None]:
+    avail = used = None
+    try:
+        root = ET.fromstring(resp.body)
+    except ET.ParseError as e:
+        raise NsdavError(f"配额响应不是合法 XML: {e}")
+    for el in root.iter():
+        tag = el.tag.rsplit("}", 1)[-1]
+        if not el.text or not el.text.strip().isdigit():
+            continue
+        if tag == "quota-available-bytes":
+            avail = int(el.text)
+        elif tag == "quota-used-bytes":
+            used = int(el.text)
+    return avail, used
+
+
+def cmd_quota(dav, args) -> int:
+    # propfind() 只回 Entry（不含 RFC 4331 的配额属性），这里要原始响应。
+    resp = dav._expect(dav.t.request(
+        "PROPFIND", dav.target("/"), body=_QUOTA_BODY,
+        headers={"Content-Type": 'application/xml; charset="utf-8"',
+                 "Depth": "0"}))
+    avail, used = _quota_numbers(resp)
+    if avail is None:
+        raise NsdavError(
+            "服务端不支持配额查询（PROPFIND 未返回 RFC 4331 的 "
+            "quota-available-bytes）")
+    if args.json:
+        print(json.dumps({"available": avail, "used": used},
+                         ensure_ascii=False, indent=2))
+    elif used is None:
+        print(f"可用 {format_size(avail)}")
+    else:
+        print(f"可用 {format_size(avail)}，已用 {format_size(used)}，"
+              f"合计 {format_size(avail + used)}")
+    return EXIT_OK
+
+
+_COMMANDS = {
+    "ls": cmd_ls, "stat": cmd_stat, "tree": cmd_tree, "cat": cmd_cat,
+    "get": cmd_get, "put": cmd_put, "mkdir": cmd_mkdir, "rm": cmd_rm,
+    "mv": cmd_mv, "cp": cmd_cp, "quota": cmd_quota,
+}
+
+
+def _dispatch(args, dav) -> int:
+    return _COMMANDS[args.cmd](dav, args)
+
+
+def main(argv: list[str] | None = None) -> int:
+    global _VERBOSE
+    args = build_parser().parse_args(argv)
+    _VERBOSE = args.verbose and not args.quiet
+    try:
+        cfg = load_config(args)
+        dav = _make_dav(cfg)
+        try:
+            return _dispatch(args, dav)
+        finally:
+            dav.t.close()
+    except KeyboardInterrupt:
+        print("\n已中断", file=sys.stderr)
+        return 130
+    except NsdavError as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return e.exit_code
+    except BrokenPipeError:
+        return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

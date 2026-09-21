@@ -1,0 +1,176 @@
+"""命令行层：argparse、cmd_* 分发、人类可读 / JSON 双输出。
+
+中间那一段是计划里 T12 的测试围栏，逐字节照抄。文末"围栏之外"一节是本
+任务在围栏之外补的三样东西：HOME 隔离 fixture，以及 P5 要求的 tree、quota
+两条用例（围栏只给了行为表，没有它们的用例代码）。
+"""
+import json
+import pytest
+
+import nsdav
+from mock_dav import MockDAV
+
+
+@pytest.fixture
+def live_dav(monkeypatch):
+    s = MockDAV()
+    base = s.start()
+    s.add_dir("/d"); s.add_file("/d/one.txt", b"1")
+    s.add_file("/d/two.txt", b"22")
+    monkeypatch.setenv("NSDAV_WEBDAV_URL", base + "/dav")
+    monkeypatch.setenv("NSDAV_WEBDAV_USER", "u")
+    monkeypatch.setenv("NSDAV_WEBDAV_PASSWORD", "p")
+    yield s
+    s.stop()
+
+
+def run(capsys, *argv):
+    code = nsdav.main(list(argv))
+    out, err = capsys.readouterr()
+    return code, out, err
+
+
+def test_ls_lists_entries(live_dav, capsys):
+    code, out, _ = run(capsys, "ls", "/d")
+    assert code == 0
+    assert "one.txt" in out and "two.txt" in out
+
+
+def test_ls_json(live_dav, capsys):
+    code, out, _ = run(capsys, "--json", "ls", "/d")
+    assert code == 0
+    data = json.loads(out)
+    assert sorted(e["name"] for e in data) == ["one.txt", "two.txt"]
+    assert data[0]["path"].startswith("/d/")
+
+
+def test_stat_json(live_dav, capsys):
+    code, out, _ = run(capsys, "--json", "stat", "/d/one.txt")
+    assert code == 0
+    d = json.loads(out)
+    assert d["size"] == 1 and d["is_dir"] is False
+
+
+def test_cat_prints_content(live_dav, capsys):
+    code, out, _ = run(capsys, "cat", "/d/two.txt")
+    assert code == 0 and out == "22"
+
+
+def test_put_then_get_roundtrip(live_dav, capsys, tmp_path):
+    src = tmp_path / "up.txt"
+    src.write_bytes(b"roundtrip")
+    code, _, _ = run(capsys, "put", str(src), "/d/up.txt")
+    assert code == 0 and live_dav.store["/d/up.txt"] == b"roundtrip"
+
+    dst = tmp_path / "down.txt"
+    code, _, _ = run(capsys, "get", "/d/up.txt", str(dst))
+    assert code == 0 and dst.read_bytes() == b"roundtrip"
+
+
+def test_mkdir_and_rm(live_dav, capsys):
+    assert run(capsys, "mkdir", "-p", "/d/a/b")[0] == 0
+    assert "/d/a/b" in live_dav.dirs
+    assert run(capsys, "rm", "-r", "-y", "/d/a")[0] == 0
+    assert "/d/a/b" not in live_dav.dirs
+
+
+def test_rm_recursive_handles_a_deep_tree(live_dav, capsys):
+    # 三层。若实现把 walk 的结果逐个删（BFS 父在子前），删掉 /d/a/b 之后
+    # 再删 /d/a/b/c 就 404 —— 实测退出码 4；只嵌一层的用例看不见这个。
+    # 递归删必须是一个 DELETE，RFC 4918 §9.6.1 规定对集合缺省就是
+    # Depth: infinity。
+    assert run(capsys, "mkdir", "-p", "/d/a/b/c")[0] == 0
+
+    assert run(capsys, "rm", "-r", "-y", "/d/a")[0] == 0
+
+    assert not [d for d in live_dav.dirs if d.startswith("/d/a")]
+
+
+def test_mv_and_cp(live_dav, capsys):
+    assert run(capsys, "cp", "/d/one.txt", "/d/one-copy.txt")[0] == 0
+    assert live_dav.store["/d/one-copy.txt"] == b"1"
+    assert run(capsys, "mv", "/d/one-copy.txt", "/d/moved.txt")[0] == 0
+    assert "/d/moved.txt" in live_dav.store
+
+
+def test_rm_recursive_without_yes_asks_and_aborts(live_dav, capsys, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda *_: "n")
+    code, out, _ = run(capsys, "rm", "-r", "/d")
+    assert code != 0
+    assert "/d/one.txt" in live_dav.store        # 没有真删
+
+
+def test_missing_remote_returns_notfound_exit_code(live_dav, capsys):
+    code, _, err = run(capsys, "stat", "/d/absent.txt")
+    assert code == nsdav.EXIT_NOTFOUND
+    assert "不存在" in err
+
+
+def test_bad_credentials_return_auth_exit_code(monkeypatch, capsys):
+    s = MockDAV(); base = s.start()
+    try:
+        monkeypatch.setenv("NSDAV_WEBDAV_URL", base + "/dav")
+        monkeypatch.setenv("NSDAV_WEBDAV_USER", "u")
+        monkeypatch.setenv("NSDAV_WEBDAV_PASSWORD", "WRONG")
+        code, _, err = run(capsys, "ls", "/")
+        assert code == nsdav.EXIT_AUTH
+    finally:
+        s.stop()
+
+
+def test_dry_run_does_not_delete(live_dav, capsys):
+    code, out, _ = run(capsys, "--dry-run", "rm", "-r", "-y", "/d")
+    assert code == 0
+    assert "/d/one.txt" in live_dav.store
+    assert "/d/one.txt" in out
+
+
+def test_format_size():
+    assert nsdav.format_size(0) == "0 B"
+    assert nsdav.format_size(999) == "999 B"
+    assert nsdav.format_size(1024) == "1.0 KiB"
+    assert nsdav.format_size(1536) == "1.5 KiB"
+    assert nsdav.format_size(5 * 1024 * 1024) == "5.0 MiB"
+
+
+# ── 围栏之外：HOME 隔离 + P5 要求的两条用例 ──
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    """测试永远不读、也不依赖真实的 HOME。
+
+    `nsdav.main()` 会经过 `load_config()` → `config_file_path()`，后者在没设
+    `XDG_CONFIG_HOME` 时回落到 `~/.config`。开发机上若真有那个文件，它就会
+    参与配置合并（`--url` 之外的字段被它悄悄改写），用例结果随开发机的 home
+    目录而变。指向 tmp_path 之后，配置文件路径必然落在临时目录里、必然不存
+    在 —— 与 tests/test_config.py 的约定一致。
+
+    autouse 放在文件末尾不影响作用域：fixture 是运行时按模块命名空间解析的。
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+
+def test_tree_prints_nested_entries(live_dav, capsys):
+    """tree 的缩进要真的反映层级，不能把整棵树拉平。"""
+    live_dav.add_dir("/d/sub")
+    live_dav.add_file("/d/sub/deep.txt", b"x")
+
+    code, out, _ = run(capsys, "tree", "/d")
+    assert code == 0
+    lines = out.splitlines()
+    assert lines[0] == "/d"
+
+    def indent_of(name):
+        line = [ln for ln in lines if ln.rstrip().endswith(name)][0]
+        return len(line) - len(line.lstrip())
+
+    assert "sub/" in out and "deep.txt" in out
+    assert indent_of("deep.txt") > indent_of("one.txt")
+
+
+def test_quota_without_rfc4331_reports_clearly(live_dav, capsys):
+    """服务端不返回 RFC 4331 属性时要说人话，不是 traceback。"""
+    code, _, err = run(capsys, "quota")
+    assert code == nsdav.EXIT_ERROR
+    assert "服务端不支持配额查询" in err
+    assert "Traceback" not in err
