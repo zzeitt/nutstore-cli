@@ -531,3 +531,137 @@ class Transport:
         if resp.status == 429:
             raise RateLimitError(f"被限流 (429)。调大 --min-gap 重试。{snippet}")
         raise NsdavError(f"HTTP {resp.status}。{snippet}")
+
+
+# ────────────────────────── WebDAV 操作层 ──────────────────────────
+
+class WebDAV:
+    """协议层。不知道有命令行这回事。"""
+
+    def __init__(self, transport: Transport,
+                 *, base_path: str = DEFAULT_BASE) -> None:
+        self.t = transport
+        self.base_path = base_path.rstrip("/") or ""
+
+    # ── 路径 ──
+
+    def target(self, rel_path: str) -> str:
+        """相对路径 → 已编码的最终 target。用于用户输入的路径。
+
+        只处理用户路径。分页的下一页 URL 不走这里 —— 它走
+        url_to_target()，因为那边已经是编码过的。
+        """
+        rel = normalize_remote_path(rel_path)
+        return enc_path(self.base_path + rel)
+
+    def _expect(self, resp) -> Response:
+        return self.t.raise_for_status_or_raise(resp)
+
+    # ── 读 ──
+
+    def propfind(self, rel_path: str, depth: str = "1") -> list[Entry]:
+        """PROPFIND，跟随 Link 分页到底。
+
+        第一页的 target 由 self.target() 编码；后续页来自 Link 头，
+        其 path 与 query 都已编码，必须原样透传，绝不能再过 enc_path。
+        """
+        entries: list[Entry] = []
+        target = self.target(rel_path)
+        page = 0
+        while True:
+            page += 1
+            resp = self._expect(self.t.request(
+                "PROPFIND", target, body=PROPFIND_BODY,
+                headers={"Content-Type": "application/xml"}, depth=depth))
+            entries.extend(parse_multistatus(resp.body, self.base_path))
+
+            nxt = parse_next_link(resp.headers.get("link"))
+            if not nxt:
+                break
+            target = url_to_target(nxt)     # 已编码，直接透传
+            if page > 10000:
+                raise NsdavError("分页层数异常，疑似服务器返回了循环的 Link 头")
+        return entries
+
+    def stat(self, rel_path: str) -> Entry:
+        entries = self.propfind(rel_path, depth="0")
+        if not entries:
+            raise NotFoundError(f"路径不存在: {rel_path}")
+        return entries[0]
+
+    def exists(self, rel_path: str) -> bool:
+        try:
+            self.stat(rel_path)
+            return True
+        except NotFoundError:
+            return False
+
+    def listdir(self, rel_path: str) -> list[Entry]:
+        want = normalize_remote_path(rel_path).rstrip("/") + "/"
+        entries = self.propfind(rel_path, depth="1")
+        out = []
+        for e in entries:
+            if e.path.rstrip("/") + ("/" if e.is_dir else "") == want:
+                continue            # 自身
+            out.append(e)
+        return out
+
+    def read(self, rel_path: str) -> bytes:
+        resp = self._expect(self.t.request("GET", self.target(rel_path)))
+        return resp.body
+
+    def walk(self, rel_path: str, max_depth: int = 0) -> Iterator[Entry]:
+        """广度优先递归。max_depth=0 表示不限深度。"""
+        queue = [(normalize_remote_path(rel_path), 1)]
+        while queue:
+            cur, depth = queue.pop(0)
+            for e in self.listdir(cur):
+                yield e
+                if e.is_dir and (max_depth == 0 or depth < max_depth):
+                    queue.append((e.path.rstrip("/"), depth + 1))
+
+    # ── 写 ──
+
+    def put(self, rel_path: str, data: bytes | StreamBody) -> None:
+        """写入。父目录不存在时自动补建后重试一次。"""
+        target = self.target(rel_path)
+        resp = self.t.request("PUT", target, body=data)
+        if resp.status == 409:
+            parent = normalize_remote_path(rel_path).rsplit("/", 1)[0]
+            self.mkdirs(parent)
+            resp = self.t.request("PUT", target, body=data)
+        self._expect(resp)
+
+    def mkcol(self, rel_path: str) -> None:
+        resp = self.t.request("MKCOL", self.target(rel_path))
+        if resp.status in (201, 204, 405):      # 405 = 已存在，视为成功
+            return
+        self._expect(resp)
+
+    def mkdirs(self, rel_path: str) -> None:
+        rel = normalize_remote_path(rel_path)
+        parts = [p for p in rel.split("/") if p]
+        for i in range(1, len(parts) + 1):
+            self.mkcol("/" + "/".join(parts[:i]))
+
+    def delete(self, rel_path: str, recursive: bool = False) -> None:
+        headers = {"Depth": "infinity"} if recursive else None
+        self._expect(self.t.request(
+            "DELETE", self.target(rel_path), headers=headers))
+
+    def _destination(self, rel_path: str) -> str:
+        scheme = "https" if self.t.use_tls else "http"
+        port = f":{self.t.port}" if self.t.port else ""
+        return f"{scheme}://{self.t.host}{port}{self.target(rel_path)}"
+
+    def move(self, src: str, dst: str, overwrite: bool = True) -> None:
+        self._expect(self.t.request("MOVE", self.target(src), headers={
+            "Destination": self._destination(dst),
+            "Overwrite": "T" if overwrite else "F",
+        }))
+
+    def copy(self, src: str, dst: str, overwrite: bool = True) -> None:
+        self._expect(self.t.request("COPY", self.target(src), headers={
+            "Destination": self._destination(dst),
+            "Overwrite": "T" if overwrite else "F",
+        }))
