@@ -731,6 +731,7 @@ def download(dav, remote_path, local_path, *, chunk=DOWNLOAD_CHUNK,
             os.remove(part)              # 旧残留，重下
         elif have == total:
             os.replace(part, local_path)
+            report(total)                # 已经是一整份，也得把进度收尾
             return local_path, total
         else:
             offset = have
@@ -745,12 +746,22 @@ def download(dav, remote_path, local_path, *, chunk=DOWNLOAD_CHUNK,
             with t.stream("GET", target,
                           headers={"Range": f"bytes={offset}-{end}"}) as resp:
                 if resp.status == 200:
-                    # 服务端忽略 Range，从头返回：丢掉已有进度重来
+                    # 服务端忽略 Range，从头返回：丢掉已有进度重来。
+                    # 这里同样必须按块读 —— 上面那个分块只约束请求粒度
+                    # （chunk 默认 16 MiB），内存界是这里的 64 KiB。整份
+                    # read() 会一次性把整个文件读进内存，把"分块只为大文件
+                    # 省内存"这个理由作废，而 iSH 上内存比时间金贵。
                     if offset:
                         f.seek(0)
                         f.truncate(0)
                         offset = 0
-                    f.write(resp.body.read())
+                    while True:
+                        buf = resp.body.read(65536)
+                        if not buf:
+                            break
+                        f.write(buf)
+                        offset += len(buf)
+                        report(offset)
                     break
                 if resp.status == 206:
                     got = 0
