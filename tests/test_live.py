@@ -7,6 +7,8 @@
 只在 /notes/nsdav-test/ 下操作，测试结束自动清理。
 """
 import os
+import sys
+
 import pytest
 
 import nsdav
@@ -26,18 +28,24 @@ pytestmark = [
 def dav():
     cfg = nsdav.load_config(type("A", (), {
         "url": None, "user": None, "password": None,
-        "min_gap": None, "max_retries": None, "timeout": None})())
+        "min_gap": None, "max_retries": None, "timeout": None})(), config={})
+    assert cfg.base_path == "/dav", (
+        f"实测只许在 /dav/notes 下；当前 base_path={cfg.base_path}，"
+        f"检查 NSDAV_WEBDAV_URL 与配置文件")
     t = nsdav.Transport(cfg.host, port=cfg.port, use_tls=cfg.use_tls,
                         user=cfg.user, password=cfg.password,
-                        base_path=cfg.base_path, min_gap=cfg.min_gap)
-    d = nsdav.WebDAV(t, base_path=cfg.base_path)
-    d.mkdirs(TEST_DIR)
-    yield d
+                        base_path=cfg.base_path, min_gap=cfg.min_gap,
+                        max_retries=cfg.max_retries, timeout=cfg.timeout)
     try:
-        d.delete(TEST_DIR, recursive=True)
-    except nsdav.NsdavError:
-        pass
-    t.close()
+        d = nsdav.WebDAV(t, base_path=cfg.base_path)
+        d.mkdirs(TEST_DIR)
+        yield d
+        try:
+            d.delete(TEST_DIR, recursive=True)
+        except nsdav.NsdavError as exc:
+            print(f"清理 {TEST_DIR} 失败，请手动删除：{exc}", file=sys.stderr)
+    finally:
+        t.close()
 
 
 def test_01_put_stat_read(dav, tmp_path):
@@ -56,6 +64,15 @@ def test_02_head_is_useless_but_propfind_is_not(dav):
 
 
 def test_03_missing_path_is_404(dav):
+    """缺失路径是 404（410 也算）—— 钉的是**服务器事实**，不是异常类型。
+
+    stat() 对"真 404"和"207 但零条目"抛的是同一个 NotFoundError，所以只写
+    pytest.raises 的话，服务器改成回 207 空 multistatus 这条仍会绿。
+    这里直接看状态码，客户端属性那一半留在下面。
+    """
+    resp = dav.t.request("PROPFIND", dav.target(f"{TEST_DIR}/definitely-absent.txt"),
+                         depth="0")
+    assert resp.status in (404, 410), f"缺失路径应回 404/410，实际 {resp.status}"
     with pytest.raises(nsdav.NotFoundError):
         dav.stat(f"{TEST_DIR}/definitely-absent.txt")
 
