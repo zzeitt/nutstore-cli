@@ -157,6 +157,37 @@ def test_connection_is_reused(dav):
     assert t._conn is made[0]          # 请求完不关连接，且还是那一条
 
 
+def test_status_retry_drops_the_connection(dav):
+    """重试**必须换一条**连接 —— 这是状态分支里 `_drop_conn()` 那行的红线。
+
+    服务器读完请求头就回 503、不读请求体（代理拒绝上传的常见形状）时，请求体
+    还在 socket 里；在**同一条**连接上重试，请求行会被接在那堆字节后面，服务器
+    看到的方法名是 `abcdefPUT`，重试必败。这条已用裸 socket 独立复现过。
+
+    只断言"最终 201"抓不到它：mock 会把 body 读干净，怎么重试都成功。所以数
+    连接条数——503 之后的那次重试必须新建一条。删掉 `_drop_conn()` 这行，本用例
+    立刻红，而其余 9 条全绿（实测）。
+    """
+    s, base = dav
+    s.fail_first_n = 1
+    s.fail_status = 503
+    t = _transport(base, max_retries=1)
+    t._sleep = lambda _s: None
+    made = []
+    real_new = t._new_conn
+
+    def counting():
+        c = real_new()
+        made.append(c)
+        return c
+
+    t._new_conn = counting
+    r = t.request("PUT", "/dav/f.bin", body=b"abcdef")
+    assert r.status == 201
+    assert len(s.requests) == 2, "503 之后必须重试一次"
+    assert len(made) == 2, f"重试复用了旧连接（只建了 {len(made)} 条）"
+
+
 def test_stream_body_retry_reopens_file(tmp_path, dav):
     s, base = dav
     p = tmp_path / "f.bin"
