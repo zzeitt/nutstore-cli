@@ -2063,11 +2063,16 @@ git commit -m "feat(core): HTTP 传输层，含连接复用与退避重试"
   - `.propfind(rel_path: str, depth: str = "1") -> list[Entry]` —— **含分页循环**
   - `.stat(rel_path) -> Entry`、`.exists(rel_path) -> bool`、`.listdir(rel_path) -> list[Entry]`
   - `.read(rel_path) -> bytes`、`.put(rel_path, data: bytes | StreamBody)`、`.mkcol(rel_path)`、`.mkdirs(rel_path)`
-  - `.delete(rel_path, recursive=False)`、`.move(src, dst)`、`.copy(src, dst)`
+  - `.delete(rel_path, recursive=False)`、`.move(src, dst, overwrite=True)`、`.copy(src, dst, overwrite=True)`
   - `.walk(rel_path, max_depth=0) -> Iterator[Entry]`
 
 **关键点：** 分页循环里，第一页用 `self.target()`（要编码），后续页用
 `url_to_target()`（**已编码，不得再编码**）。这是最容易写错的地方。
+
+**第二条关键点：** `delete` 的 `recursive=False` **不能**只是"不带头"。
+DELETE 对集合缺省就是 `Depth: infinity`（RFC 4918 §9.6.1），协议里没有"删空
+目录"这个操作，所以这半边只能在客户端兜住：目标是目录就拒绝。T12 的 `rm`
+（不带 `-r`）依赖这条守卫；不设它，`nsdav rm somedir` 会静默删掉整棵子树。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -2104,6 +2109,9 @@ def test_listdir_excludes_self(dav):
     d.put("/a/two.txt", b"22")
     names = sorted(e.name for e in d.listdir("/a"))
     assert names == ["one.txt", "two.txt"]
+    # 目标本身是**文件**时，depth=1 只会返回它自己；它必须是空列表，
+    # 不能把自己当成自己的子项返回（那会让 `walk("f")` 把 f 吐出来）。
+    assert d.listdir("/a/one.txt") == [], [e.path for e in d.listdir("/a/one.txt")]
 
 
 def test_listdir_follows_pagination():
@@ -2214,6 +2222,26 @@ def test_delete_recursive(dav):
     assert not d.exists("/t")
 
 
+def test_delete_directory_requires_recursive(dav):
+    """recursive=False 撞上目录必须拒绝，且**一个字节都不能删**。
+
+    这条用例盯着的是"用例无法为它名字里的行为而失败"那类漏子：上面那条
+    `test_delete_recursive` 删的是 recursive=True，而 recursive=False 这半边
+    从来没人走过。实测把 delete 里那行 Depth 头整个去掉（等于开关失效），
+    89 条全绿，`/t/a.txt` 和 `/t/sub` 却被一起删光了——mock 和 RFC 4918 §9.6.1
+    一样，集合缺省就是 infinity。所以断言分两段：先拒绝，再确认什么都没少。
+    """
+    s, base = dav
+    d = _dav(s, base)
+    d.mkcol("/d"); d.mkcol("/d/sub"); d.put("/d/a.txt", b"1")
+    with pytest.raises(nsdav.NsdavError):
+        d.delete("/d")
+    assert d.exists("/d/a.txt"), "拒绝之前就把东西删了"
+    assert d.exists("/d/sub"), "拒绝之前就把子目录删了"
+    d.delete("/d", recursive=True)
+    assert not d.exists("/d/a.txt")
+
+
 def test_move_and_copy(dav):
     s, base = dav
     d = _dav(s, base)
@@ -2239,6 +2267,23 @@ def test_walk_depth_limited(dav):
     shallow = [e.path for e in d.walk("/w", max_depth=1)]
     assert "/w/f.txt" in shallow and "/w/sub/" in shallow
     assert "/w/sub/g.txt" not in shallow
+
+
+def test_walk_unlimited_depth(dav):
+    """max_depth=0（默认值，文档写明"不限深度"）必须真的递归下去。
+
+    此前 12 条里 walk 的递归下降一次都没被执行过：上面那条只走 max_depth=1，
+    实测把递归条件改成 `if False:` 依然全量绿（89 passed），而改成无脑
+    `if e.is_dir:` 只有上面那一条红。也就是说 `queue.append` / `depth + 1` /
+    队列消费整段没人看，默认值本身也零覆盖。这条用例走默认值、下到第三层。
+    """
+    s, base = dav
+    d = _dav(s, base)
+    d.mkcol("/w"); d.mkcol("/w/sub"); d.mkcol("/w/sub/deep")
+    d.put("/w/sub/deep/x.txt", b"3")
+    paths = [e.path for e in d.walk("/w")]
+    assert "/w/sub/" in paths, paths
+    assert "/w/sub/deep/x.txt" in paths, paths
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -2317,8 +2362,13 @@ class WebDAV:
         entries = self.propfind(rel_path, depth="1")
         out = []
         for e in entries:
-            if e.path.rstrip("/") + ("/" if e.is_dir else "") == want:
-                continue            # 自身
+            # 自身条目一律排除。早先只比 `e.path + ("/" if is_dir)` 与带尾斜杠的
+            # want：目录目标能正确排除自己，目标若是**文件**则 depth=1 只返回它
+            # 自己、href 不带尾斜杠，于是被当成"自己的子项"返回，`listdir("f")`
+            # 得到 `[f]`、`walk("f")` 也把它 yield 出来。去掉两边尾斜杠再比，
+            # 两种目标都对：只有目标本身相等，子项一律不同。
+            if e.path.rstrip("/") == want.rstrip("/"):
+                continue
             out.append(e)
         return out
 
@@ -2361,6 +2411,19 @@ class WebDAV:
             self.mkcol("/" + "/".join(parts[:i]))
 
     def delete(self, rel_path: str, recursive: bool = False) -> None:
+        """删文件或目录。目标是目录时必须显式 `recursive=True`。
+
+        WebDAV 的 DELETE 对集合**缺省就是 `Depth: infinity`**（RFC 4918
+        §9.6.1），所以"不带 Depth 头"并不等于"只删空目录"——服务器照样删整棵
+        子树。实测（协议层 + mock 一致）：把下面那行 Depth 头整个去掉，89 条
+        用例全绿，而 `/d/a.txt` 连同 `/d/sub` 一起没了。协议里没有"删空目录"
+        这个操作，所以这个开关只能在客户端自己兜住：先看清目标是不是目录，
+        是就拒绝，让调用方明确说要递归。
+        """
+        if not recursive and self.stat(rel_path).is_dir:
+            raise NsdavError(
+                f"{rel_path} 是目录：DELETE 对集合缺省就是递归的，"
+                f"要删整棵子树请显式传 recursive=True")
         headers = {"Depth": "infinity"} if recursive else None
         self._expect(self.t.request(
             "DELETE", self.target(rel_path), headers=headers))
