@@ -1610,7 +1610,7 @@ git commit -m "test: 添加可注入故障的进程内 mock WebDAV 服务器"
   - `class Transport(host, *, port=None, use_tls=True, user, password, ua=NS_UA, base_path=DEFAULT_BASE, min_gap=DEFAULT_MIN_GAP, max_retries=DEFAULT_MAX_RETRIES, timeout=DEFAULT_TIMEOUT, verbose=False, limiter=None, rand=random.random)`
   - `.request(method, target, *, body: bytes | StreamBody | None = None, headers=None, depth=None) -> Response` —— **`target` 必须是已编码的最终形式**
   - `@contextmanager .stream(method, target, *, headers=None) -> Iterator[Response]` —— body 为 `http.client.HTTPResponse`，供下载分块读
-  - `.close()`、`.raise_for_status(resp)`
+  - `.close()`、`.raise_for_status_or_raise(resp)`
 
 **关键点：**
 1. **连接复用**（实测 6 倍速度差）。连接失效时丢弃并重连一次。
@@ -1636,12 +1636,17 @@ def dav():
     s.stop()
 
 
-def _transport(base, **kw):
+def _transport(base, *, password="p", **kw):
+    """password 必须走构造。
+
+    它不能留在 **kw 里：Transport 的 __init__ 有显式的 password 形参，从 **kw
+    再传一次就是 duplicate kwarg，直接 TypeError。
+    """
     from urllib.parse import urlsplit
     u = urlsplit(base)
     return nsdav.Transport(
         u.hostname, port=u.port, use_tls=False,
-        user="u", password="p",
+        user="u", password=password,
         min_gap=0, **kw,
     )
 
@@ -1655,9 +1660,19 @@ def test_sends_preemptive_basic_auth(dav):
 
 
 def test_bad_credentials_raise_auth_error(dav):
+    """错凭据要在**构造时**给进去，不能构造完再改属性。
+
+    原来写的是 `t.password = "wrong"`，但 Transport 构造时就把 Authorization
+    头算好存下（preemptive，这正是它的意义），对象上根本没有 user/password
+    属性——那句赋值只是往实例上挂了个死属性，线上发的仍是 `Basic dTpw`(u:p)，
+    服务器回 207，于是 `pytest.raises(AuthError)` 永远等不到 AuthError。
+    写这两条时脑子里想的是 mock 的写法：MockDAV 每次请求现读
+    `self.password`（plan:1343），改属性立刻生效；客户端不是这样，也不该是
+    这样——整个计划里给客户端 password 的赋值只有这两条用例，生产调用点
+    （plan:3117）只有构造那一次，所以是测试写歪了，不是实现少了个属性。
+    """
     s, base = dav
-    t = _transport(base)
-    t.password = "wrong"
+    t = _transport(base, password="wrong")
     with pytest.raises(nsdav.AuthError):
         t.raise_for_status_or_raise(t.request("PROPFIND", "/dav/", depth="0"))
 
@@ -1699,8 +1714,7 @@ def test_gives_up_after_max_retries():
 
 def test_auth_failure_is_not_retried(dav):
     s, base = dav
-    t = _transport(base, max_retries=5)
-    t.password = "wrong"
+    t = _transport(base, password="wrong", max_retries=5)
     r = t.request("PROPFIND", "/dav/", depth="0")
     assert r.status == 401
     assert len(s.requests) == 1        # 401 绝不重试
