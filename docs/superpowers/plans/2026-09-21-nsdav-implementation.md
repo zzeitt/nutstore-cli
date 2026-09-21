@@ -2824,19 +2824,29 @@ def test_upload_verifies_size(dav, tmp_path, monkeypatch):
 
 
 def test_upload_strong_verify_detects_corruption(dav, tmp_path):
+    """strong 要抓到"长度不变、内容变了"，而 size 校验抓不到。
+
+    篡改的是**末尾** 10 字节，因为 strong 读回并比对的是末尾 VERIFY_TAIL_BYTES
+    个字节。这条用例原先篡改的是开头 10 字节，读回窗口覆盖不到 —— 实测
+    （T10 预检，5 条里红 1 条）红在 `DID NOT RAISE NsdavError`，用例无法为它
+    名字里的行为而通过。`verify="size"` 那一段钉住"两种校验真有差别"：长度
+    没变时 size 校验必须放行，否则 strong 多花的那个请求就没有意义。
+    """
     s, base = dav
     d, t = _dav(s, base)
     src = tmp_path / "u.txt"
-    payload = b"abcdefghij" * 10
+    payload = b"abcdefghij" * 10        # 100 字节
     src.write_bytes(payload)
 
-    # 让 PUT 写完就篡改内容，长度不变 —— 只有 strong 校验能发现
+    # 让 PUT 写完就篡改**末尾**内容，长度不变 —— 只有 strong 校验能发现
     real_put = d.put
     def corrupting_put(p, data):
         real_put(p, data)
-        s.store[p] = b"XXXXXXXXXX" + payload[10:]
+        s.store[p] = payload[:-10] + b"XXXXXXXXXX"
     d.put = corrupting_put
 
+    # 长度没变，size 校验看不出来
+    assert nsdav.upload(d, str(src), "/u.txt", verify="size") == 100
     with pytest.raises(nsdav.NsdavError, match="校验失败"):
         nsdav.upload(d, str(src), "/u.txt", verify="strong")
 
