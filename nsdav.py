@@ -5,8 +5,9 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 __version__ = "0.1.0"
 
@@ -111,3 +112,53 @@ def normalize_remote_path(raw: str) -> str:
             continue
         out.append(seg)
     return "/" + "/".join(out)
+
+
+# ─────────────────────────── Link 头 / 分页 ───────────────────────────
+
+def _split_link_values(header: str) -> list[str]:
+    """按逗号切分 Link 头，但不切 <> 和引号内部的逗号。"""
+    out: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    in_quotes = False
+    for ch in header:
+        if ch == '"':
+            in_quotes = not in_quotes
+        elif ch == "<" and not in_quotes:
+            depth += 1
+        elif ch == ">" and not in_quotes:
+            depth -= 1
+        if ch == "," and depth == 0 and not in_quotes:
+            out.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def parse_next_link(header: str | None) -> str | None:
+    """从 Link 头里取出 rel="next" 的 URL，没有就返回 None。"""
+    if not header:
+        return None
+    for part in _split_link_values(header):
+        m = re.match(r"\s*<([^>]+)>\s*(.*)$", part, re.S)
+        if not m:
+            continue
+        url, params = m.group(1), m.group(2)
+        for pm in re.finditer(r'(\w+)\s*=\s*"([^"]*)"', params):
+            if pm.group(1).lower() == "rel" and "next" in pm.group(2).split():
+                return url
+    return None
+
+
+def url_to_target(url: str) -> str:
+    """把完整 URL 变成 http.client 用的 target。
+
+    注意：path 和 query 都已经是编码过的，结果必须【直接】交给
+    Transport，绝不能再过一次 enc_path。
+    """
+    sp = urlsplit(url)
+    return sp.path + (("?" + sp.query) if sp.query else "")
