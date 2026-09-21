@@ -252,16 +252,30 @@ def test_config_file_path_falls_back_to_dot_config(monkeypatch):
 
 # ── 修复轮 2：范围化复审提出的洞 ──
 
+@pytest.mark.parametrize("source", ["cli", "env", "config"])
 @pytest.mark.parametrize("bad", ["inf", "-inf", "nan"])
-def test_non_finite_numbers_are_usage_errors(bad):
-    """inf / nan 能穿过上下限比较，必须在入口就被拒（否则 settimeout 处 traceback）。"""
-    env = dict(_CRED, **{"NSDAV_TIMEOUT": bad})
+def test_non_finite_numbers_are_usage_errors(source, bad):
+    """inf / nan 能穿过上下限比较，三个来源都必须在入口被拒。
+
+    cli 那组喂的是真正的 float —— T12 的 argparse 就是 `--timeout type=float`，
+    所以"只在字符串来源上做有限性检查"这类变异必须在这里红。
+    """
+    if source == "cli":
+        args, env, cfg = Args(timeout=float(bad)), _CRED, {}
+    elif source == "env":
+        args, env, cfg = Args(), dict(_CRED, **{"NSDAV_TIMEOUT": bad}), {}
+    else:
+        args, env, cfg = Args(), _CRED, {"timeout": bad}
     with pytest.raises(nsdav.UsageError):
-        nsdav.load_config(Args(), env=env, config={})
+        nsdav.load_config(args, env=env, config=cfg)
 
 
 @pytest.mark.parametrize("bad", ["https://", "http:///dav"])
 def test_url_without_host_is_usage_error(bad):
-    """解析不出主机名要报 UsageError（exit 2），不是让 None 流进 Transport。"""
+    """解析不出主机名要报 UsageError（exit 2），不是让 None 流进 Transport。
+
+    显式传齐凭据：这样它只钉 `_split_url` 的"没有主机名"分支，
+    不额外依赖"URL 检查排在凭据检查之前"这个顺序。
+    """
     with pytest.raises(nsdav.UsageError):
-        nsdav.load_config(Args(url=bad), env={}, config={})
+        nsdav.load_config(Args(url=bad), env=_CRED, config={})
