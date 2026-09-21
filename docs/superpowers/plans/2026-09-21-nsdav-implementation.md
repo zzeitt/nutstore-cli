@@ -79,16 +79,26 @@ import nsdav
     ("/emoji/🎉.md", "/emoji/%F0%9F%8E%89.md"),
     ("/pct/100%.txt", "/pct/100%25.txt"),    # 字面 % 必须转义
     ("/hash/a#b.txt", "/hash/a%23b.txt"),
-    ("/q/a?b.txt", "/q/a%3Fb.txt"),          # 未配对 '?' 属于路径
+    ("/q/a?b.txt", "/q/a%3Fb.txt"),          # 文件名里的字面 '?' 也要能访问
 ])
 def test_enc_path_encodes_segments(raw, expected):
     assert nsdav.enc_path(raw) == expected
 
 
-def test_enc_path_passes_query_through_untouched():
-    # 分页 marker 已经是编码过的，再编一次会变成 %252F -> 服务端 400
-    raw = "/dav/notes?mk=%2Fnotes%2Fa.txt"
-    assert nsdav.enc_path(raw) == "/dav/notes?mk=%2Fnotes%2Fa.txt"
+def test_enc_path_has_no_query_concept():
+    """enc_path 眼里没有 query 这回事，'?' 就是普通路径字符。
+
+    分页 marker 从不经过这里 —— 它走 url_to_target（Task 2），那条路
+    原样透传已编码的 URL。所以双编码 bug 在调用图上就被排除了，
+    不需要 enc_path 去"小心处理 query"。
+
+    期望值里 '=' 变 %3D、'%2F' 变 %252F，不是笔误：enc_path 收到的是
+    "用户原始路径"，每个字符都是字面的，'%' 自然也当字面百分号编码
+    （和上面 100%.txt 那例一致）。分页 marker 里那个已经是 %2F 的值
+    永远不会走到这里，所以这里编出来的 %252F 无害 —— 双编码之所以
+    不可能发生，靠的是调用图，不是这里的小心处理。
+    """
+    assert nsdav.enc_path("/dav/x?mk=%2Fy") == "/dav/x%3Fmk%3D%252Fy"
 
 
 @pytest.mark.parametrize("raw,expected", [
@@ -220,14 +230,16 @@ class Entry:
 # ─────────────────────────────── 路径处理 ───────────────────────────────
 
 def enc_path(raw: str) -> str:
-    """把未编码的路径编成可上线的形式。
+    """把未编码的路径逐段编码。
 
-    只处理路径部分；'?' 之后的 query 原样保留 —— 分页 marker 本身
-    已经是编码过的，再编一次会变成 %252F，服务端会返回 400。
+    这里没有 query 的概念：'?' 和 '#' 一样，都是普通路径字符，会被
+    编码掉。这样文件名里带 '?' 也能正常访问。
+
+    分页 marker 不走这里 —— 它由 url_to_target() 原样透传已编码的
+    URL 给 Transport。双编码 bug 因此在调用图上就不可能发生，而不是
+    靠"记得别编 query"这种约定来避免。
     """
-    path, sep, query = raw.partition("?")
-    encoded = "/".join(quote(seg, safe="") for seg in path.split("/"))
-    return encoded + (sep + query if sep else "")
+    return "/".join(quote(seg, safe="") for seg in raw.split("/"))
 
 
 def normalize_remote_path(raw: str) -> str:
@@ -1747,10 +1759,14 @@ class WebDAV:
 
     # ── 路径 ──
 
-    def target(self, rel_path: str, query: str | None = None) -> str:
-        """相对路径 → 已编码的最终 target。用于用户输入的路径。"""
+    def target(self, rel_path: str) -> str:
+        """相对路径 → 已编码的最终 target。用于用户输入的路径。
+
+        只处理用户路径。分页的下一页 URL 不走这里 —— 它走
+        url_to_target()，因为那边已经是编码过的。
+        """
         rel = normalize_remote_path(rel_path)
-        return enc_path(self.base_path + rel) + (query or "")
+        return enc_path(self.base_path + rel)
 
     def _expect(self, resp) -> Response:
         return self.t.raise_for_status_or_raise(resp)

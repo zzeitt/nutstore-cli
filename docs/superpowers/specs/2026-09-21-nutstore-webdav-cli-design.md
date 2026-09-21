@@ -94,31 +94,37 @@ WebDAV 层可以对着假 Transport 测，CLI 层几乎不用测。
 
 ### `enc_path` 的实现要点
 
-分页踩过的坑就在这里。正确做法是**把路径和 query 分开处理**：
+分页踩过的坑就在这里，但结论比"小心别重复编码"更干净：**干脆让 `enc_path`
+不知道 query 的存在**。
 
 ```python
-def enc_path(p):
-    path, _, query = p.partition("?")
-    encoded = "/".join(quote(seg, safe="") for seg in path.split("/"))
-    return encoded + ("?" + query if query else "")
+def enc_path(raw):
+    return "/".join(quote(seg, safe="") for seg in raw.split("/"))
 ```
 
-路径段逐个 `quote(safe="")`，保证空格变 `%20`、`+` 变 `%2B`、中文和 emoji 正确。
-而 query 部分**原样透传**，因为 Link 头里给出的 `mk` 值已经是编码过的，
-再编码一次就会变成 `%252F`，服务端返回 400。这个错误在 spike 阶段真实发生过。
+路径段逐个 `quote(safe="")`，保证空格变 `%20`、`+` 变 `%2B`、中文和 emoji
+正确，`?` 和 `#` 也一并编码——这样文件名里带 `?` 的也能访问。
 
-**由此推出一条必须遵守的规则**：`enc_path` 只能用于**用户输入的原始路径**。
-从 `Link` 头拿到的下一页 URL，其 path 和 query **都已经是编码过的**，
-必须原样送给 `http.client`，**不能再过一次 `enc_path`**。
+那 query 谁管？**没人管，因为根本不需要管。** 有两条通往 `Transport` 的路，
+各走各的：
 
-否则会踩一个很隐蔽的坑：如果目录名里有空格，Link 里给的是
-`/dav/notes/my%20notes?mk=...`，再过一次 `enc_path` 会把它变成
-`my%2520notes`，服务端去找一个名字里真带 `%20` 的目录，然后 404——
-而且只在"目录名含特殊字符 **且** 条目超过 750 条"时才出现。
+| 来源 | 处理 | 说明 |
+|---|---|---|
+| 用户输入的路径 | `WebDAV.target()` → `enc_path()` | 未编码，需要编码 |
+| `Link` 头的下一页 URL | `url_to_target()` | 已编码，**原样透传** |
 
-实现上用一个显式的标记区分：Transport 层接收的 target 分两种，
-一种是"未编码的原始路径"，一种"已经完全成形的 URL"。
-不要靠猜，靠显式参数或类型区分。
+`Transport` 收到的 `target` 永远是"已编码的最终形式"，它不做任何编码。
+两条路在 `Transport` 汇合，彼此不交叉——**双编码在调用图上就不可能发生**，
+不需要靠"记得别编 query"这种约定去防。
+
+这个坑在 spike 阶段真实发生过：当时把 `Link` 里的
+`?mk=%2Ffoo%2Fa.txt` 又编了一遍，`%2F` 变成 `%252F`，服务端返回 400。
+
+更隐蔽的是它的变体：目录名含空格且条目超过 750 条时，`Link` 给的是
+`/dav/notes/my%20notes?mk=...`，重复编码会变成 `my%2520notes`，
+服务端去找一个名字里真带 `%20` 的目录，然后 404——只有"目录名含特殊字符
+**且** 条目超过 750 条"两个条件同时满足才会出现。让 `enc_path` 根本不
+认识 query，这个变体就一并消失了。
 
 ## 5. 命令
 
