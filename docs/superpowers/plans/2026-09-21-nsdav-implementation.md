@@ -3280,6 +3280,18 @@ def test_mkdir_and_rm(live_dav, capsys):
     assert "/d/a/b" not in live_dav.dirs
 
 
+def test_rm_recursive_handles_a_deep_tree(live_dav, capsys):
+    # 三层。若实现把 walk 的结果逐个删（BFS 父在子前），删掉 /d/a/b 之后
+    # 再删 /d/a/b/c 就 404 —— 实测退出码 4；只嵌一层的用例看不见这个。
+    # 递归删必须是一个 DELETE，RFC 4918 §9.6.1 规定对集合缺省就是
+    # Depth: infinity。
+    assert run(capsys, "mkdir", "-p", "/d/a/b/c")[0] == 0
+
+    assert run(capsys, "rm", "-r", "-y", "/d/a")[0] == 0
+
+    assert not [d for d in live_dav.dirs if d.startswith("/d/a")]
+
+
 def test_mv_and_cp(live_dav, capsys):
     assert run(capsys, "cp", "/d/one.txt", "/d/one-copy.txt")[0] == 0
     assert live_dav.store["/d/one-copy.txt"] == b"1"
@@ -3514,22 +3526,30 @@ def cmd_mkdir(dav, args) -> int:
 
 
 def cmd_rm(dav, args) -> int:
-    # 先子后父：walk 是 BFS（父在子前），把它放在最前面、目标目录放最后，
-    # 顺序恰好是先删空每一层、最后删根。反过来会先删父目录、子项已不存在。
-    targets = [normalize_remote_path(args.path)]
-    if args.recursive and dav.stat(args.path).is_dir:
-        targets = [e.path for e in dav.walk(args.path)] + targets
-    if args.recursive and not args.yes and not args.dry_run:
-        for p in targets:
+    target = normalize_remote_path(args.path)
+    if not (args.recursive and dav.stat(target).is_dir):
+        if args.dry_run:
+            print(f"将删除 {target}")
+            return EXIT_OK
+        dav.delete(target)              # 目录且非递归时 T8 的守卫会拒绝
+        return EXIT_OK
+
+    # 递归删整棵树就是**一个** DELETE：RFC 4918 §9.6.1 规定对集合缺省
+    # Depth: infinity。别自己拆成逐个删 —— walk 是 BFS、父在子前，删掉父目录
+    # 之后子项已不存在，两层以上必然 404（实测：三层时退出码 4，而 T12 原有
+    # 用例只嵌一层，看不到）。列出来只为确认提示与 --dry-run。
+    doomed = [target] + [e.path for e in dav.walk(target)]
+    if args.dry_run:
+        for p in doomed:
+            print(f"将删除 {p}")
+        return EXIT_OK
+    if not args.yes:
+        for p in doomed:
             print(p)
-        if not _confirm(f"以上 {len(targets)} 项将被递归删除，确认？[y/N] "):
+        if not _confirm(f"以上 {len(doomed)} 项将被递归删除，确认？[y/N] "):
             print("已取消", file=sys.stderr)
             return EXIT_ERROR
-    for p in targets:
-        if args.dry_run:
-            print(f"将删除 {p}")
-        else:
-            dav.delete(p, recursive=args.recursive)
+    dav.delete(target, recursive=True)
     return EXIT_OK
 
 
