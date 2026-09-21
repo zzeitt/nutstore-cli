@@ -28,15 +28,21 @@ apk add python3
 #    paste 法（把本地文件内容粘进终端，Ctrl-D 结束）：
 cat > nsdav.py
 
-#    或者在 iSH 里克隆整个仓库（如果你已经有仓库地址）：
-#    git clone <仓库地址> && cd nutstore-cli
+#    或者克隆整个仓库（仓库尚未公开，地址待定）：
+#    git clone <待定> && cd nutstore-cli
 
-# 3. 跑起来（先看根目录）
+# 3. 先配好凭据（第 4 步就用得上；没配会以退出码 3 报"缺少账号或密码"）。
+#    最省事的是环境变量（密码是应用密码，不是登录密码）：
+export NSDAV_WEBDAV_USER="you@example.com"
+export NSDAV_WEBDAV_PASSWORD="应用密码"
+
+# 4. 跑起来（先看根目录）
 python3 nsdav.py ls /
 ```
 
-首次运行需要账号和应用密码，见下面「配置」一节。密码要到坚果云网页上
-**账户信息 → 安全选项 → 添加应用密码**去生成，**不是登录密码**。
+密码要到坚果云网页上 **账户信息 → 安全选项 → 添加应用密码** 去生成，
+**不是登录密码**。除了环境变量，还可以用命令行参数或配置文件，三种方式
+和优先级见下面「配置」一节。
 
 ## 命令
 
@@ -174,8 +180,9 @@ timeout = 30
 不是照协议文档推测的。它们是这个工具真正在防的东西。
 
 - **`HEAD` 完全不可用**：`HEAD` 问一个 16 字节的文件，`Content-Length` 回的
-  是 `0`。所以客户端一次 `HEAD` 都不发——大小只从 PROPFIND 的
-  `getcontentlength`，或 Range GET 的 `Content-Range` 拿。
+  是 `0`。所以客户端一次 `HEAD` 都不发——**大小一律来自 PROPFIND 的
+  `getcontentlength`**（也就是每次先 `stat()`），没有第二个来源。`Range`
+  GET 只用来搬内容与断点续传，不参与确定大小。
 - **缺路径是 `404`，不是 `410`**：挂载点 `/dav/` **内部**的缺失路径一律 404。
   只有在 `/dav/` 之外才会看到 410，那说的是挂载点不存在。（早期实测在这里
   走过弯路，见设计稿 §2。）
@@ -225,14 +232,30 @@ timeout = 30
 
 ## 输出：stdout 和 stderr 是分开的
 
-- **stdout**：`ls` / `stat` / `tree` / `quota` 的结果，`--json` 的 JSON，以及
-  `cat` 的原始字节。**只给数据**。
+- **stdout**：`ls` / `stat` / `tree` / `quota` 的结果，`--json` 的 JSON，
+  `cat` 的原始字节，**以及 `--dry-run` 的"将…"行、`rm -r` 的待删清单和
+  `[y/N]` 确认提示**。
 - **stderr**：进度条、`-v` 的请求日志、`get`/`put` 的完成行
-  （`已下载 …` / `已上传 …`）、以及所有告警和错误。
+  （`已下载 …` / `已上传 …`）、`rm -r` 回答 no 时的 `已取消`，以及所有
+  告警和错误。
 
-所以 `nsdav get big.iso > log.txt` **不会**把"已下载 …"写进 `log.txt`；
-要连日志一起收，得写 `nsdav get big.iso > log.txt 2>> log.txt`。反过来，
-`nsdav ls / > list.txt` 拿到的是一份干净的列表。
+**注意下面这条：stdout 并不总是"干净的数据"。** `--dry-run` 的"将删除 …"
+清单、`rm -r` 在删除前列出的每一项、以及 `以上 N 项将被递归删除，确认？[y/N]`
+这个提示，走的都是 stdout（实测 `--dry-run rm -r` 退出码 0，stderr 全空；
+`rm -r` 回答 no 退出码 1，`已取消` 才写 stderr）。所以：
+
+```sh
+# 待删清单会进 out.txt，不是进终端
+nsdav --dry-run rm -r /x > out.txt
+```
+
+**脚本里别把 stdout 当纯数据流。** 要机器可读的输出就只用 `--json`
+（`ls` / `stat` / `tree` / `quota`）；`--dry-run` 与 `rm -r` 的提示是给人看的
+文本，别当输入。
+
+另一半仍然成立：`nsdav get big.iso > log.txt` **不会**把"已下载 …"写进
+`log.txt`；要连日志一起收，得写 `nsdav get big.iso > log.txt 2>> log.txt`。
+反过来，`nsdav ls / > list.txt` 拿到的是一份干净的列表。
 
 ## Python 版本要求
 
