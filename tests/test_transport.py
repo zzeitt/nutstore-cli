@@ -96,12 +96,65 @@ def test_auth_failure_is_not_retried(dav):
     assert len(s.requests) == 1        # 401 绝不重试
 
 
+def test_410_is_treated_as_missing():
+    """410 也当未找到——全局约束里写死的一条，之前一条用例都没看它。
+
+    `410 not in RETRYABLE_STATUS`，所以注入一次就够了，顺带断言它**不被重试**。
+    """
+    s = MockDAV(fail_first_n=1, fail_status=410)
+    base = s.start()
+    try:
+        t = _transport(base, max_retries=5)
+        t._sleep = lambda _s: None
+        with pytest.raises(nsdav.NotFoundError):
+            t.raise_for_status_or_raise(
+                t.request("PROPFIND", "/dav/", depth="0"))
+        assert len(s.requests) == 1     # 410 不是可重试状态
+    finally:
+        s.stop()
+
+
+def test_429_raises_rate_limit_error():
+    """429 映射到 RateLimitError（退出码 5），且确实按 2 秒起跳重试。"""
+    s = MockDAV(fail_first_n=99, fail_status=429)
+    base = s.start()
+    try:
+        t = _transport(base, max_retries=1, rand=lambda: 0.5)
+        sleeps = []
+        t._sleep = sleeps.append
+        r = t.request("PROPFIND", "/dav/", depth="0")
+        assert r.status == 429
+        assert len(s.requests) == 2     # 首次 + 1 次重试
+        assert sleeps == [2.0]          # 429 与 503 同为 2 秒起跳
+        with pytest.raises(nsdav.RateLimitError):
+            t.raise_for_status_or_raise(r)
+    finally:
+        s.stop()
+
+
 def test_connection_is_reused(dav):
+    """复用要**真的只有一条 TCP 连接**，这里数连接的创建次数。
+
+    原来只断言 `t._conn is not None`——那只说明"请求完没关连接"。把 `_get_conn`
+    改成每次都新建连接（复用 100% 失效）照样绿：实测 3 次请求 3 条连接。而关键点 1
+    里"实测 6 倍速度差"靠的就是这条复用，名字里的行为不能没人看。
+    """
     s, base = dav
     t = _transport(base)
+    made = []
+    real_new = t._new_conn
+
+    def counting():
+        c = real_new()
+        made.append(c)
+        return c
+
+    t._new_conn = counting
     for _ in range(3):
         t.request("PROPFIND", "/dav/", depth="0")
-    assert t._conn is not None         # 请求完不关连接
+    assert len(s.requests) == 3
+    assert len(made) == 1, f"3 次请求建了 {len(made)} 条连接，复用没生效"
+    assert t._conn is made[0]          # 请求完不关连接，且还是那一条
 
 
 def test_stream_body_retry_reopens_file(tmp_path, dav):

@@ -479,6 +479,13 @@ class Transport:
                 continue
 
             if resp.status in RETRYABLE_STATUS and attempt <= self.max_retries:
+                # 重试前必须换掉这条连接。服务器可能没读净请求体就回了 503
+                # （代理常见做法：读完头就拒绝），剩下的字节留在 socket 里，
+                # 下一次请求会被它们的**前面**接上，服务器看到的方法名是
+                # `abcdefPUT` 这种垃圾，重试注定失败。异常路径下面已经换连接
+                # （_attempt 里 _drop_conn），状态路径当时漏了。
+                # 代价是重试时丢掉连接复用——重试本来就罕见，划算。
+                self._drop_conn()
                 d = backoff_delay(attempt, resp.status, rand=self._rand)
                 self._log(f"HTTP {resp.status}，{d:.1f}s 后重试 "
                           f"{attempt}/{self.max_retries}")
