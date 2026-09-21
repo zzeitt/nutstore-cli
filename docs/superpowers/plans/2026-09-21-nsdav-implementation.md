@@ -2730,6 +2730,8 @@ def test_ignored_range_fallback_still_reads_in_chunks(dav, tmp_path):
     sizes = [n for sp in spies for n in sp.sizes]
     assert sizes, "一次 read 都没有？"
     assert all(isinstance(n, int) and 0 < n <= 65536 for n in sizes), sizes
+    # 回退路径只有这条用例走得到，进度也就只能在这里钉：一路报到 total。
+    assert seen[-1] == (len(payload), len(payload)), seen[-1]
 
 
 class _ConnSpy:
@@ -2779,8 +2781,6 @@ def test_stream_drain_on_failure_is_bounded(dav):
     sizes = [n for r in sink for n in r.sizes]
     assert sizes, "一次 read 都没有？"
     assert all(isinstance(n, int) and 0 < n <= 65536 for n in sizes), sizes
-    # 回退路径只有这条用例走得到，进度也就只能在这里钉：一路报到 total。
-    assert seen[-1] == (len(payload), len(payload)), seen[-1]
 
 
 def test_progress_reports_from_the_resume_point(dav, tmp_path):
@@ -2819,6 +2819,7 @@ def test_progress_reports_when_part_is_already_complete(dav, tmp_path):
 
     assert dest.read_bytes() == payload
     assert seen == [(51200, 51200)], seen
+
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
