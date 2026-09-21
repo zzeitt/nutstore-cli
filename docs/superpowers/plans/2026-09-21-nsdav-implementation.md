@@ -1177,16 +1177,21 @@ class MockDAV:
                     del outer.store[rel]
                     self._simple(204)
                     return
-                target = rel.rstrip("/")
+                target = rel.rstrip("/") or "/"
                 if target in outer.dirs:
                     if depth != "infinity":
                         self._simple(400)
                         return
+                    # 根上 target + "/" 会拼出 "//"，一个子项都匹配不到，于是
+                    # 删了根、里面的东西原封不动留下来——mock 自己造出一个
+                    # "删了一半"的世界，正是这个项目最怕的形状。根是常驻的
+                    # （`dirs` 初值就是 {"/"}），所以它自己留下，只清内容。
+                    prefix = target if target == "/" else target + "/"
                     for k in [k for k in outer.store
-                              if k == target or k.startswith(target + "/")]:
+                              if k == target or k.startswith(prefix)]:
                         del outer.store[k]
-                    for d in [d for d in outer.dirs
-                              if d == target or d.startswith(target + "/")]:
+                    for d in [d for d in outer.dirs if d != "/"
+                              and (d == target or d.startswith(prefix))]:
                         outer.dirs.discard(d)
                     self._simple(204)
                     return
@@ -1223,7 +1228,7 @@ class MockDAV:
                 depth = (self.headers.get("Depth") or "1").lower()
                 if rel in outer.store:
                     items = [(rel, False)]
-                elif rel.rstrip("/") in outer.dirs:
+                elif (rel.rstrip("/") or "/") in outer.dirs:
                     base = rel.rstrip("/") or ""
                     items = [(rel if rel.endswith("/") else rel + "/", True)]
                     if depth != "0":
@@ -1400,6 +1405,68 @@ def test_mock_fails_first_n_then_succeeds():
         assert _req(base, "PROPFIND", "/dav/", headers={"Depth": "0"})[0] == 503
         assert _req(base, "PROPFIND", "/dav/", headers={"Depth": "0"})[0] == 503
         assert _req(base, "PROPFIND", "/dav/", headers={"Depth": "0"})[0] == 207
+    finally:
+        s.stop()
+
+
+def test_mock_root_propfind_and_pagination():
+    """根目录也要能 PROPFIND，而且要能翻页。
+
+    `dirs` 里根的键是 `"/"`（`_rel()` 也把根规范化成 `"/"`），但 `_do_propfind`
+    当初查的是 `rel.rstrip("/")`，根落成 `""`，查不到，于是整棵树从根上就 404。
+    `_rel()`、`_do_mkcol`、`_do_move`、`_do_copy` 四处都写了 `or "/"`，只有这里
+    和 `_do_delete` 漏了——是笔误，不是设计。
+
+    这条用例的另一半价值在**翻页**：原来唯一的分页用例打的是 `/dav/d` 子目录，
+    根的 Link 头从没被跟随过。这里跟着 mock 自己发出来的 Link 走，等于同时钉住
+    "Link 的目标真的可用"。
+
+    别把每页的条数写成 4：page_size=2 时第一页只有 2 条，`== 4` 这种断言是
+    把"总条数"当成了"单页条数"（这版第一稿就是这么写的，跑出来才发现）。
+    四条的完整性由最后那行 href 汇总来钉。
+    """
+    s = MockDAV(page_size=2); base = s.start()
+    try:
+        _req(base, "MKCOL", "/dav/a")
+        _req(base, "MKCOL", "/dav/b")
+        _req(base, "PUT", "/dav/root.txt", b"r")
+        hrefs = []
+        st, hd, bd = _req(base, "PROPFIND", "/dav/", headers={"Depth": "1"})
+        assert st == 207, ("root PROPFIND status", st)
+        assert bd.count(b"<d:response>") == 2, bd[:300]
+        hrefs += [h.split(b"<")[0] for h in bd.split(b"<d:href>")[1:]]
+        assert 'rel="next"' in hd["Link"], hd
+
+        sp = urllib.parse.urlsplit(hd["Link"].split(">")[0].lstrip("<"))
+        st, hd, bd = _req(base, "PROPFIND", sp.path + "?" + sp.query,
+                          headers={"Depth": "1"})
+        assert st == 207, ("page2 status", st)
+        assert bd.count(b"<d:response>") == 2, bd[:300]
+        hrefs += [h.split(b"<")[0] for h in bd.split(b"<d:href>")[1:]]
+        assert "Link" not in hd, ("还有下一页", hd.get("Link"))
+
+        assert sorted(hrefs) == [b"/dav/", b"/dav/a/", b"/dav/b/", b"/dav/root.txt"]
+    finally:
+        s.stop()
+
+
+def test_mock_root_delete_clears_the_tree():
+    """根 DELETE 必须连子目录一起清掉，而且根自己留下。
+
+    `target + "/"` 在根上拼出 `"//"`，一个子项都匹配不到：根删了，里面的东西
+    全留着。mock 是后续所有测试的回归网，网自己删一半留一半，比网小更糟。
+    """
+    s = MockDAV(); base = s.start()
+    try:
+        _req(base, "MKCOL", "/dav/a")
+        _req(base, "PUT", "/dav/a/f.txt", b"x")
+        st, _, _ = _req(base, "DELETE", "/dav/", headers={"Depth": "infinity"})
+        assert st == 204
+        assert _req(base, "GET", "/dav/a/f.txt")[0] == 404
+        assert _req(base, "PROPFIND", "/dav/a", headers={"Depth": "0"})[0] == 404
+        # 根是常驻的：内容清空后根自己还在，只有自身那一条。
+        st, _, bd = _req(base, "PROPFIND", "/dav/", headers={"Depth": "1"})
+        assert st == 207 and bd.count(b"<d:response>") == 1
     finally:
         s.stop()
 ```
