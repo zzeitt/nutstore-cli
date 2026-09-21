@@ -128,7 +128,9 @@ def _split_link_values(header: str) -> list[str]:
         elif ch == "<" and not in_quotes:
             depth += 1
         elif ch == ">" and not in_quotes:
-            depth -= 1
+            # 钳在 0：多余的 '>' 若让 depth 变负，后面每个逗号都判不出
+            # depth == 0，整条头会塌成一段，分页链接就静默丢了
+            depth = max(0, depth - 1)
         if ch == "," and depth == 0 and not in_quotes:
             out.append("".join(buf))
             buf = []
@@ -140,7 +142,15 @@ def _split_link_values(header: str) -> list[str]:
 
 
 def parse_next_link(header: str | None) -> str | None:
-    """从 Link 头里取出 rel="next" 的 URL，没有就返回 None。"""
+    """从 Link 头里取出 rel="next" 的 URL，没有就返回 None。
+
+    rel 的值按 RFC 8288 既可以是 quoted-string，也可以是裸 token
+    （rel=next）。两种都必须认：漏掉裸 token 那种就是静默丢分页 ——
+    目录超过 750 条时会少列文件，而且没有任何信号告诉用户。
+
+    RFC 8288 §2.1.1 还要求注册关系类型逐字符不区分大小写比较，所以
+    rel="Next" 同样算 next；参数名与参数值都不区分大小写。
+    """
     if not header:
         return None
     for part in _split_link_values(header):
@@ -148,8 +158,9 @@ def parse_next_link(header: str | None) -> str | None:
         if not m:
             continue
         url, params = m.group(1), m.group(2)
-        for pm in re.finditer(r'(\w+)\s*=\s*"([^"]*)"', params):
-            if pm.group(1).lower() == "rel" and "next" in pm.group(2).split():
+        for pm in re.finditer(r'(\w+)\s*=\s*("[^"]*"|[^\s;,"]+)', params):
+            value = pm.group(2).strip('"').lower()
+            if pm.group(1).lower() == "rel" and "next" in value.split():
                 return url
     return None
 
