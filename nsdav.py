@@ -8,6 +8,7 @@ from __future__ import annotations
 import email.utils
 import random
 import re
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import timezone
@@ -300,3 +301,28 @@ def backoff_delay(
     raw = base * (2 ** (attempt - 1))
     raw *= 1.0 + jitter * (2.0 * rand() - 1.0)
     return min(raw, _BACKOFF_CAP)
+
+
+# ────────────────────────────── 限流器 ──────────────────────────────
+
+class RateLimiter:
+    """串行 + 最小间隔。单线程 CLI，不需要锁。"""
+
+    def __init__(
+        self,
+        min_gap: float = DEFAULT_MIN_GAP,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.min_gap = max(0.0, min_gap)
+        self._clock = clock
+        self._sleep = sleep
+        self._last: float | None = None
+
+    def wait(self) -> None:
+        if self._last is not None and self.min_gap > 0:
+            delta = self._clock() - self._last
+            if delta < self.min_gap:
+                self._sleep(self.min_gap - delta)
+        self._last = self._clock()
