@@ -3262,10 +3262,17 @@ def test_cli_args_beat_env():
 
 
 def test_config_file_used_when_env_absent():
+    """config 的 url 真的被用上：主机/端口/明文/路径四项都要断言。
+
+    用非默认值（默认是 https://dav.jianguoyun.com/dav）—— 拿默认值断言的话，
+    "根本没读 config 的 url"这个变异也能全绿。
+    """
     c = nsdav.load_config(Args(), env={}, config={
-        "url": "https://dav.jianguoyun.com/dav",
+        "url": "http://cfg.example.com:8081/dav2",
         "user": "file@x.com", "password": "filepw",
     })
+    assert (c.host, c.port, c.use_tls, c.base_path) == (
+        "cfg.example.com", 8081, False, "/dav2")
     assert c.user == "file@x.com" and c.password == "filepw"
 
 
@@ -3282,6 +3289,7 @@ def test_missing_credentials_raise_with_guidance():
     msg = str(ei.value)
     assert "NSDAV_WEBDAV_USER" in msg
     assert "--user" in msg
+    assert "config.toml" in msg
 
 
 def test_min_gap_and_retries_overridable():
@@ -3289,7 +3297,6 @@ def test_min_gap_and_retries_overridable():
     c = nsdav.load_config(
         Args(min_gap=1.5, max_retries=9, timeout=300), env=env, config={})
     assert c.min_gap == 1.5 and c.max_retries == 9 and c.timeout == 300
-
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -3305,6 +3312,9 @@ Expected: FAIL —— `AttributeError: module 'nsdav' has no attribute 'load_con
 CONFIG_ENV_URL = "NSDAV_WEBDAV_URL"
 CONFIG_ENV_USER = "NSDAV_WEBDAV_USER"
 CONFIG_ENV_PASSWORD = "NSDAV_WEBDAV_PASSWORD"
+
+# 3.11 以下没有 tomllib：那时配置文件被忽略（会告警），只能靠环境变量/命令行。
+TOML_AVAILABLE = sys.version_info >= (3, 11)
 
 
 @dataclass
@@ -3338,9 +3348,13 @@ def _read_config_file(path: str | None = None) -> dict[str, str]:
         pass
     try:
         with open(path, "rb") as f:
-            if sys.version_info >= (3, 11):
-                import tomllib
-                return {k: str(v) for k, v in tomllib.load(f).items()}
+            if not TOML_AVAILABLE:
+                print(f"警告: 当前 Python 不支持 TOML（{sys.version.split()[0]}），"
+                      f"已忽略配置文件 {path}；请改用环境变量或命令行参数",
+                      file=sys.stderr)
+                return {}
+            import tomllib
+            return {k: str(v) for k, v in tomllib.load(f).items()}
     except Exception as e:
         print(f"警告: 读取 {path} 失败: {e}", file=sys.stderr)
     return {}
@@ -3350,7 +3364,11 @@ def _split_url(url: str) -> tuple[str, int | None, bool, str]:
     sp = urlsplit(url if "://" in url else "https://" + url)
     if not sp.hostname:
         raise UsageError(f"无法解析 WebDAV 地址: {url}")
-    return (sp.hostname, sp.port, sp.scheme != "http",
+    try:
+        port = sp.port
+    except ValueError as e:
+        raise UsageError(f"WebDAV 地址里的端口不合法: {url}") from e
+    return (sp.hostname, port, sp.scheme != "http",
             sp.path.rstrip("/") or DEFAULT_BASE)
 
 
@@ -3387,24 +3405,34 @@ def load_config(args, *, env=None, config=None) -> Config:
         host=host, port=port, use_tls=use_tls, base_path=base_path,
         user=user, password=password,
         min_gap=_number(pick(getattr(args, "min_gap", None), "NSDAV_MIN_GAP",
-                             "min_gap", DEFAULT_MIN_GAP), float, "min_gap"),
+                             "min_gap", DEFAULT_MIN_GAP), float, "min_gap",
+                        minimum=0.0),
         max_retries=_number(pick(getattr(args, "max_retries", None),
                                  "NSDAV_MAX_RETRIES", "max_retries",
-                                 DEFAULT_MAX_RETRIES), int, "max_retries"),
+                                 DEFAULT_MAX_RETRIES), int, "max_retries",
+                            minimum=0),
         timeout=_number(pick(getattr(args, "timeout", None), "NSDAV_TIMEOUT",
-                             "timeout", DEFAULT_TIMEOUT), float, "timeout"),
+                             "timeout", DEFAULT_TIMEOUT), float, "timeout",
+                        minimum=0.0, exclusive=True),
     )
 ```
 
 `_number` 处理配置文件那边读出来的字符串：
 
 ```python
-def _number(value, cast, name: str):
-    """配置文件里数值也是字符串，统一在这里转，并给出可读的报错。"""
+def _number(value, cast, name: str, *, minimum=None, exclusive=False):
+    """配置文件里数值也是字符串，统一在这里转，并给出可读的报错。
+
+    `minimum` 给出下限：默认"不能小于"，`exclusive=True` 时"必须大于"。
+    """
     try:
-        return cast(value)
+        n = cast(value)
     except (TypeError, ValueError) as e:
         raise UsageError(f"配置项 {name} 不是合法数值: {value!r}") from e
+    if minimum is not None and (n <= minimum if exclusive else n < minimum):
+        rel = "必须大于" if exclusive else "不能小于"
+        raise UsageError(f"配置项 {name} {rel} {minimum}: {value!r}")
+    return n
 ```
 
 在 `tests/test_config.py` 里补一条覆盖配置文件路径的用例：
@@ -3423,10 +3451,17 @@ def test_bad_config_number_raises_usage_error():
         nsdav.load_config(Args(), env=env, config={"min_gap": "abc"})
 ```
 
-**实现者补的护栏用例。** 派发时要求「测试永不碰真实 HOME」，这些就是那条纪律的落地：
+**实现者补的护栏用例 + 修复轮 1 的用例。** 派发时要求「测试永不碰真实 HOME」，
+前四条是那条纪律的落地；后四条（`test_bad_port…` / `test_out_of_range…` /
+`test_version_gate…` / `test_config_file_path_falls_back…`）是任务 11 复审后的
+修复轮补的。
+
+**重组规则：** 本节的**三段测试围栏**（Step 1 的文件头+核心用例、Step 3 的这条、
+以及上面这一段）**按顺序用两个空行拼接**，逐字节等于仓库的 `tests/test_config.py`
+（21 条 `def test_`）。两段实现围栏用同样的规则拼接，等于 `nsdav.py` 从
+`# ── 配置 ──` 到文件末的那一段。
 
 ```python
-
 # ── 调优项的默认值与环境变量 ──
 
 def test_tuning_knobs_default_and_from_env():
@@ -3516,6 +3551,47 @@ def test_config_spreads_directly_into_transport():
     assert (t.host, t.port, t.use_tls) == ("127.0.0.1", 8080, False)
     assert t.base_path == "/dav" and t.max_retries == 5 and t.timeout == 120.0
 
+
+# ── 修复轮 1：复审提出的洞 ──
+
+@pytest.mark.parametrize("bad", ["https://h:99999/dav", "https://h:abc/dav"])
+def test_bad_port_is_usage_error_not_valueerror(bad):
+    """端口越界/非数字要报 UsageError（exit 2），不是裸 ValueError 的 traceback。"""
+    with pytest.raises(nsdav.UsageError):
+        nsdav.load_config(Args(url=bad), env={}, config={})
+
+
+@pytest.mark.parametrize("key,value", [
+    ("NSDAV_MIN_GAP", "-1"),
+    ("NSDAV_MAX_RETRIES", "-1"),
+    ("NSDAV_TIMEOUT", "0"),
+    ("NSDAV_TIMEOUT", "-5"),
+])
+def test_out_of_range_numbers_are_usage_errors(key, value):
+    """三个旋钮的下限：min_gap/max_retries 不能小于 0，timeout 必须大于 0。"""
+    env = {"NSDAV_WEBDAV_USER": "u", "NSDAV_WEBDAV_PASSWORD": "p", key: value}
+    with pytest.raises(nsdav.UsageError):
+        nsdav.load_config(Args(), env=env, config={})
+
+
+def test_version_gate_warns_and_ignores_config(tmp_path, monkeypatch, capsys):
+    """没有 tomllib 时：配置文件被忽略，但必须**出声**，不能静默。"""
+    path = _write(tmp_path, 'url = "https://h/dav"\n')
+    monkeypatch.setattr(nsdav, "TOML_AVAILABLE", False)
+    assert nsdav._read_config_file(path) == {}
+    err = capsys.readouterr().err
+    assert "已忽略配置文件" in err and path in err
+
+
+def test_config_file_path_falls_back_to_dot_config(monkeypatch):
+    """没设 XDG_CONFIG_HOME 时落到 ~/.config（expanduser 的结果）。"""
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setattr(nsdav.os.path, "expanduser",
+                        lambda p: "/fake/home" if p == "~" else p)
+    # 分隔符交给 os.path.join：本仓库在 Windows 上跑，硬编 "/" 会红。
+    assert nsdav.config_file_path() == os.path.join(
+        "/fake/home", ".config", "nsdav", "config.toml")
+
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -3550,8 +3626,8 @@ git commit -m "feat(config): 参数/环境变量/配置文件三级优先级"
 - **关于 import（承 P6）：** 本节代码块不含 import，实现者自己补
   `import argparse` 与 `import json`（`nsdav.py` 顶部：前者在 `base64` 前，
   后者在 `http.client` 后；`sys`/`os` 已有）。漏了它们，`tests/test_cli.py`
-  11 条全红在 `NameError: name 'argparse' is not defined`（实测，见 ledger 的
-  整体预检）。
+  13 条里 12 条红在 `NameError: name 'argparse' is not defined`（其余 1 条是
+  `format_size`，它不经过 `main`，仍绿）—— 实测重放，见 ledger 的 T12 预检。
 
 - [ ] **Step 1: 写失败的测试**
 
