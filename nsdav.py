@@ -1215,13 +1215,21 @@ def _quota_numbers(resp) -> tuple[int | None, int | None]:
         root = ET.fromstring(resp.body)
     except ET.ParseError as e:
         raise NsdavError(f"配额响应不是合法 XML: {e}")
+    if root.tag != f"{DAV}multistatus":
+        # 与 parse_multistatus 同一道把关：外层不是 multistatus 就不是配额
+        # 响应。回 (None, None)，交给 cmd_quota 那条"服务端不支持配额查询"
+        # 的报错路径 —— 这里静默返回就等于"配额为 0"，正是本文件反复在防的
+        # 那种静默失败。
+        return None, None
+    # 属性按**全名**比对（DAV 常量 + local name），不按 local name：`DAV:`
+    # 之外命名空间里同名的属性不算数。全局约束要求 XML 一律按命名空间解析，
+    # 不得用字符串匹配，本文件其它地方（parse_multistatus）就是这么做的。
     for el in root.iter():
-        tag = el.tag.rsplit("}", 1)[-1]
         if not el.text or not el.text.strip().isdigit():
             continue
-        if tag == "quota-available-bytes":
+        if el.tag == f"{DAV}quota-available-bytes":
             avail = int(el.text)
-        elif tag == "quota-used-bytes":
+        elif el.tag == f"{DAV}quota-used-bytes":
             used = int(el.text)
     return avail, used
 

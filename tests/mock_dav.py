@@ -22,6 +22,11 @@ class MockDAV:
         # 请求的服务器。T9 的续传必须能从这种回退里恢复（关键点之一，
         # 但在此之前没有任何用例走到过那条分支）。
         self.ignore_range = False
+        # 配额查询（RFC 4331）的响应体，由用例整段给出；None = 本 mock 不支持
+        # 配额，照旧回普通 multistatus（T12 的"服务端不支持"用例走这条）。
+        # 真实服务器也只在被问到时才回这几个属性，所以触发条件看请求体里有没有
+        # quota-available-bytes，不看路径。
+        self.quota_body: bytes | None = None
         self.user = user
         self.password = password
         self.store: dict[str, bytes] = {}
@@ -213,6 +218,11 @@ class MockDAV:
             def _do_propfind(self, body):
                 rel = self._rel()
                 depth = (self.headers.get("Depth") or "1").lower()
+                if outer.quota_body is not None \
+                        and b"quota-available-bytes" in body:
+                    self._simple(207, outer.quota_body, {
+                        "Content-Type": "application/xml; charset=utf-8"})
+                    return
                 if rel in outer.store:
                     items = [(rel, False)]
                 elif (rel.rstrip("/") or "/") in outer.dirs:
