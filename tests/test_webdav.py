@@ -1,7 +1,10 @@
+import dataclasses
+
 import pytest
 
 import nsdav
 from mock_dav import MockDAV
+from nsdav import normalize_remote_path
 
 
 @pytest.fixture
@@ -203,3 +206,44 @@ def test_walk_unlimited_depth(dav):
     paths = [e.path for e in d.walk("/w")]
     assert "/w/sub/" in paths, paths
     assert "/w/sub/deep/x.txt" in paths, paths
+
+
+def test_delete_plain_file_without_recursive(dav):
+    # 守卫只该拦目录。文件走的是最常见的分支，此前一条用例都没碰它。
+    s, base = dav
+    d = _dav(s, base)
+    s.add_file("/f.txt", b"x")
+
+    d.delete("/f.txt")
+
+    assert "/f.txt" not in s.store
+
+
+def test_delete_root_without_recursive_is_refused(dav):
+    # 根目录是目录，非递归就该拒绝——顺带钉住"拒绝时什么都没删"。
+    s, base = dav
+    d = _dav(s, base)
+    s.add_file("/a.txt", b"x")
+
+    with pytest.raises(nsdav.NsdavError, match="是目录"):
+        d.delete("/", recursive=False)
+
+    assert "/a.txt" in s.store
+
+
+def test_walk_terminates_when_a_directory_lists_itself(dav):
+    # 服务端把目录自己当成它的子项报回来时，walk 必须能返回。
+    # 注意这条用例失败的样子是"挂起"而不是"报错"：没有 visited 集合时
+    # 它无限入队，pytest 不会红，只会一直转。
+    s, base = dav
+    d = _dav(s, base)
+    d.mkdirs("/loop")
+    real = d.stat("/loop")
+
+    def loopy(rel_path, depth="1"):
+        cur = normalize_remote_path(rel_path)
+        return [dataclasses.replace(real, path=cur)]
+
+    d.listdir = loopy
+
+    assert len(list(d.walk("/loop"))) == 1

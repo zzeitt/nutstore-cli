@@ -616,10 +616,21 @@ class WebDAV:
         return resp.body
 
     def walk(self, rel_path: str, max_depth: int = 0) -> Iterator[Entry]:
-        """广度优先递归。max_depth=0 表示不限深度。"""
+        """广度优先递归。max_depth=0 表示不限深度。
+
+        seen 记录已经列过的目录。服务端把某个祖先当成自己的子项报回来时
+        （同一目录的两种拼写就会这样，`listdir` 的自过滤按规范化路径比，
+        拼写一不同就漏过去），没有它这里会无限入队：不报错、不返回，直接把
+        进程挂死。实测：把自过滤改成永不命中，整个测试套件就停不下来。
+        """
         queue = [(normalize_remote_path(rel_path), 1)]
+        seen: set[str] = set()
         while queue:
             cur, depth = queue.pop(0)
+            key = cur.rstrip("/") or "/"
+            if key in seen:
+                continue
+            seen.add(key)
             for e in self.listdir(cur):
                 yield e
                 if e.is_dir and (max_depth == 0 or depth < max_depth):
