@@ -512,7 +512,13 @@ class Transport:
                            r)          # type: ignore[arg-type]
         finally:
             try:
-                r.read()            # 读完，连接才能复用
+                # 读干净连接才能复用，但必须按块读：整份 read() 会在**中途失败**
+                # 时把剩下的全部字节一次装进内存 —— 磁盘写满（ENOSPC）、进度
+                # 回调抛异常、Ctrl-C 都从这条 finally 穿出去，而 .part/续传存在
+                # 的理由正是这些场景。成功路径上两条循环都读到了 EOF，drain
+                # 读到的是空串，所以这个洞只有失败路径看得见。
+                while r.read(65536):
+                    pass
             except Exception:
                 self._drop_conn()
 
