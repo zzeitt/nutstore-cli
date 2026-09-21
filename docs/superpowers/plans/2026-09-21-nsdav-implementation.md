@@ -3208,7 +3208,14 @@ git commit -m "feat(transfer): 流式上传与大小/内容校验"
 `tests/test_config.py`：
 
 ```python
+"""配置层：命令行参数 → 环境变量 → 配置文件 → 内置默认。
+
+所有用例一律显式传 `env=` / `config=`，需要真实文件的用例也都落在
+`tmp_path` 里 —— 测试永远不读、也不依赖真实的 HOME。
+"""
+import dataclasses
 import os
+
 import pytest
 
 import nsdav
@@ -3282,6 +3289,7 @@ def test_min_gap_and_retries_overridable():
     c = nsdav.load_config(
         Args(min_gap=1.5, max_retries=9, timeout=300), env=env, config={})
     assert c.min_gap == 1.5 and c.max_retries == 9 and c.timeout == 300
+
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -3413,6 +3421,101 @@ def test_bad_config_number_raises_usage_error():
     env = {"NSDAV_WEBDAV_USER": "u", "NSDAV_WEBDAV_PASSWORD": "p"}
     with pytest.raises(nsdav.UsageError, match="min_gap"):
         nsdav.load_config(Args(), env=env, config={"min_gap": "abc"})
+```
+
+**实现者补的护栏用例。** 派发时要求「测试永不碰真实 HOME」，这些就是那条纪律的落地：
+
+```python
+
+# ── 调优项的默认值与环境变量 ──
+
+def test_tuning_knobs_default_and_from_env():
+    env = {"NSDAV_WEBDAV_USER": "u", "NSDAV_WEBDAV_PASSWORD": "p"}
+    c = nsdav.load_config(Args(), env=env, config={})
+    assert c.min_gap == nsdav.DEFAULT_MIN_GAP
+    assert c.max_retries == nsdav.DEFAULT_MAX_RETRIES
+    assert c.timeout == nsdav.DEFAULT_TIMEOUT
+    assert c.port is None and c.use_tls is True
+
+    env.update({"NSDAV_MIN_GAP": "0.75", "NSDAV_MAX_RETRIES": "2",
+                "NSDAV_TIMEOUT": "45"})
+    c = nsdav.load_config(Args(), env=env, config={})
+    assert c.min_gap == 0.75 and c.max_retries == 2 and c.timeout == 45
+
+
+# ── 配置文件：一律走显式路径，绝不落到真实 HOME ──
+
+def _write(tmp_path, text: str) -> str:
+    p = tmp_path / "config.toml"
+    p.write_text(text, encoding="utf-8")
+    return str(p)
+
+
+def test_config_file_path_honours_xdg(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert nsdav.config_file_path() == os.path.join(
+        str(tmp_path), "nsdav", "config.toml")
+
+
+def test_read_config_file_missing_path_is_empty(tmp_path):
+    assert nsdav._read_config_file(str(tmp_path / "nope.toml")) == {}
+
+
+def test_read_config_file_returns_strings(tmp_path):
+    path = _write(tmp_path, 'user = "file@x.com"\n'
+                            'password = "pw"\n'
+                            'min_gap = 1.5\n'
+                            'max_retries = 9\n')
+    assert nsdav._read_config_file(path) == {
+        "user": "file@x.com", "password": "pw",
+        "min_gap": "1.5", "max_retries": "9",
+    }
+
+
+def test_load_config_from_file_on_disk(tmp_path):
+    path = _write(tmp_path, 'url = "https://dav.jianguoyun.com/dav/"\n'
+                            'user = "file@x.com"\npassword = "pw"\n'
+                            'min_gap = "0.5"\nmax_retries = "7"\n'
+                            'timeout = "30"\n')
+    c = nsdav.load_config(Args(), env={}, config=nsdav._read_config_file(path))
+    assert c.host == "dav.jianguoyun.com" and c.base_path == "/dav"
+    assert c.user == "file@x.com" and c.password == "pw"
+    assert c.min_gap == 0.5 and c.max_retries == 7 and c.timeout == 30
+
+
+def test_explicit_config_is_not_second_guessed_by_the_real_file(
+        tmp_path, monkeypatch):
+    """显式传了 config= 就只认它。
+
+    把 XDG_CONFIG_HOME 指到 tmp_path 并真放一份可用配置：即便它就在手边，
+    显式传入的空映射也必须说了算。这条同时也是"测试不碰真实 HOME"的护栏 ——
+    只要哪天 load_config 又顺手去读默认路径，这里就会红。
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "nsdav").mkdir()
+    (tmp_path / "nsdav" / "config.toml").write_text(
+        'user = "home@x.com"\npassword = "pw"\n', encoding="utf-8")
+    with pytest.raises(nsdav.AuthError):
+        nsdav.load_config(Args(), env={}, config={})
+
+
+# ── 与 Task 12 的接口约定 ──
+
+def test_config_spreads_directly_into_transport():
+    """Task 12 会把 Config 直接摊平交给 Transport，字段名必须一一对上。"""
+    fields = {f.name for f in dataclasses.fields(nsdav.Config)}
+    assert fields == {"host", "port", "use_tls", "user", "password",
+                      "base_path", "min_gap", "max_retries", "timeout"}
+    env = {"NSDAV_WEBDAV_URL": "http://127.0.0.1:8080/dav",
+           "NSDAV_WEBDAV_USER": "u", "NSDAV_WEBDAV_PASSWORD": "p"}
+    c = nsdav.load_config(Args(), env=env, config={})
+    t = nsdav.Transport(c.host, port=c.port, use_tls=c.use_tls, user=c.user,
+                        password=c.password, base_path=c.base_path,
+                        min_gap=c.min_gap, max_retries=c.max_retries,
+                        timeout=c.timeout)
+    assert (t.host, t.port, t.use_tls) == ("127.0.0.1", 8080, False)
+    assert t.base_path == "/dav" and t.max_retries == 5 and t.timeout == 120.0
+
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
