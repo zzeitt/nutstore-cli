@@ -145,9 +145,11 @@ addopts = -m "not live"
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import email.utils
 import http.client
+import json
 import math
 import os
 import random
@@ -1110,6 +1112,11 @@ class MockDAV:
         # 请求的服务器。T9 的续传必须能从这种回退里恢复（关键点之一，
         # 但在此之前没有任何用例走到过那条分支）。
         self.ignore_range = False
+        # 配额查询（RFC 4331）的响应体，由用例整段给出；None = 本 mock 不支持
+        # 配额，照旧回普通 multistatus（T12 的"服务端不支持"用例走这条）。
+        # 真实服务器也只在被问到时才回这几个属性，所以触发条件看请求体里有没有
+        # quota-available-bytes，不看路径。
+        self.quota_body: bytes | None = None
         self.user = user
         self.password = password
         self.store: dict[str, bytes] = {}
@@ -1301,6 +1308,11 @@ class MockDAV:
             def _do_propfind(self, body):
                 rel = self._rel()
                 depth = (self.headers.get("Depth") or "1").lower()
+                if outer.quota_body is not None \
+                        and b"quota-available-bytes" in body:
+                    self._simple(207, outer.quota_body, {
+                        "Content-Type": "application/xml; charset=utf-8"})
+                    return
                 if rel in outer.store:
                     items = [(rel, False)]
                 elif (rel.rstrip("/") or "/") in outer.dirs:
@@ -3549,7 +3561,6 @@ def _number(value, cast, name: str, *, minimum=None, exclusive=False):
         rel = "必须大于" if exclusive else "不能小于"
         raise UsageError(f"配置项 {name} {rel} {minimum}: {value!r}")
     return n
-
 ```
 
 在 `tests/test_config.py` 里补一条覆盖配置文件路径的用例：
@@ -3799,6 +3810,12 @@ git commit -m "feat(config): 参数/环境变量/配置文件三级优先级"
 `tests/test_cli.py`：
 
 ```python
+"""命令行层：argparse、cmd_* 分发、人类可读 / JSON 双输出。
+
+中间那一段是计划里 T12 的测试围栏，逐字节照抄。文末"围栏之外"一节是本
+任务在围栏之外补的三样东西：HOME 隔离 fixture，以及 P5 要求的 tree、quota
+两条用例（围栏只给了行为表，没有它们的用例代码）。
+"""
 import json
 import pytest
 
@@ -3889,9 +3906,11 @@ def test_mv_and_cp(live_dav, capsys):
 
 
 def test_rm_recursive_without_yes_asks_and_aborts(live_dav, capsys, monkeypatch):
-    monkeypatch.setattr("builtins.input", lambda *_: "n")
+    asked = _answer_input(monkeypatch, "n")
     code, out, _ = run(capsys, "rm", "-r", "/d")
     assert code != 0
+    assert asked, "没有问过就中止了 —— 那不是确认，是直接拒绝"
+    assert "/d/one.txt" in out                   # 待删清单先列出来
     assert "/d/one.txt" in live_dav.store        # 没有真删
 
 
@@ -3926,6 +3945,144 @@ def test_format_size():
     assert nsdav.format_size(1024) == "1.0 KiB"
     assert nsdav.format_size(1536) == "1.5 KiB"
     assert nsdav.format_size(5 * 1024 * 1024) == "5.0 MiB"
+
+
+# ── 围栏之外：HOME 隔离、P5 的两条用例、修复轮 1 的 F1/F2 ──
+
+def _answer_input(monkeypatch, reply):
+    """把 `builtins.input` 换成记录器，返回它收到的提问列表。
+
+    只有"被问过"这件事被钉住，`_confirm` 才不是摆设：一个从不调 `input`、
+    直接回中止的变异，光看"退出码非 0、文件还在"是看不出来的。
+    """
+    asked = []
+
+    def fake(prompt=""):
+        asked.append(prompt)
+        return reply
+
+    monkeypatch.setattr("builtins.input", fake)
+    return asked
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    """测试永远不读、也不依赖真实的 HOME。
+
+    `nsdav.main()` 会经过 `load_config()` → `config_file_path()`，后者在没设
+    `XDG_CONFIG_HOME` 时回落到 `~/.config`。开发机上若真有那个文件，它就会
+    参与配置合并（`--url` 之外的字段被它悄悄改写），用例结果随开发机的 home
+    目录而变。指向 tmp_path 之后，配置文件路径必然落在临时目录里、必然不存
+    在 —— 与 tests/test_config.py 的约定一致。
+
+    autouse 放在文件末尾不影响作用域：fixture 是运行时按模块命名空间解析的。
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+
+def test_rm_recursive_answering_yes_deletes(live_dav, capsys, monkeypatch):
+    """确认了才删：答 `y` 走真删路径（`n` 那半在围栏里）。"""
+    asked = _answer_input(monkeypatch, "y")
+    code, _, _ = run(capsys, "rm", "-r", "/d")
+    assert code == 0
+    assert asked
+    assert not [k for k in live_dav.store if k.startswith("/d")]
+
+
+def test_rm_with_yes_does_not_ask(live_dav, capsys, monkeypatch):
+    """`-y` 就是"别再问"：此时 `input` 一次都不能被调到。"""
+    def boom(prompt=""):
+        raise AssertionError(f"给了 -y 还问：{prompt!r}")
+
+    monkeypatch.setattr("builtins.input", boom)
+    code, _, _ = run(capsys, "rm", "-r", "-y", "/d")
+    assert code == 0
+    assert "/d/one.txt" not in live_dav.store
+
+
+def test_tree_prints_nested_entries(live_dav, capsys):
+    """tree 的缩进要真的反映层级，不能把整棵树拉平。"""
+    live_dav.add_dir("/d/sub")
+    live_dav.add_file("/d/sub/deep.txt", b"x")
+
+    code, out, _ = run(capsys, "tree", "/d")
+    assert code == 0
+    lines = out.splitlines()
+    assert lines[0] == "/d"
+
+    def indent_of(name):
+        line = [ln for ln in lines if ln.rstrip().endswith(name)][0]
+        return len(line) - len(line.lstrip())
+
+    assert "sub/" in out and "deep.txt" in out
+    assert indent_of("deep.txt") > indent_of("one.txt")
+
+
+def test_quota_without_rfc4331_reports_clearly(live_dav, capsys):
+    """服务端不返回 RFC 4331 属性时要说人话，不是 traceback。"""
+    code, _, err = run(capsys, "quota")
+    assert code == nsdav.EXIT_ERROR
+    assert "服务端不支持配额查询" in err
+    assert "Traceback" not in err
+
+
+# RFC 4331 的配额响应，属性带诱饵：`urn:example` 里的同名属性排在真值**两侧**，
+# 数值都不同（真值 222 / 444，诱饵 111 / 999 / 333 / 888）。命名空间一旦被忽略，
+# "后写覆盖"的实现取到尾诱饵 999、"首个命中"的实现取到前诱饵 111，两种写法都
+# 拿不到 222 —— 只喂一条 `DAV:` 属性的话，这两种退化实现全是绿的。
+# （诱饵只在真值前面时挡不住前者：实测 M1 那种"退回 local name 匹配"的实现是
+# 后写覆盖，前诱饵会被真值覆盖掉。见 task-12-report-fix1.md 的变异表。）
+QUOTA_XML = (
+    b'<?xml version="1.0" encoding="utf-8"?>'
+    b'<D:multistatus xmlns:D="DAV:" xmlns:x="urn:example">'
+    b'<D:response><D:href>/dav/</D:href><D:propstat><D:prop>'
+    b'<x:quota-available-bytes>111</x:quota-available-bytes>'
+    b'<x:quota-used-bytes>333</x:quota-used-bytes>'
+    b'<D:quota-available-bytes>222</D:quota-available-bytes>'
+    b'<D:quota-used-bytes>444</D:quota-used-bytes>'
+    b'<x:quota-available-bytes>999</x:quota-available-bytes>'
+    b'<x:quota-used-bytes>888</x:quota-used-bytes>'
+    b'</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>'
+    b'</D:response></D:multistatus>'
+)
+
+
+def test_quota_non_multistatus_root_reports_unsupported(live_dav, capsys):
+    """外层不是 multistatus 时也要报"服务端不支持"。
+
+    这里故意带一条 `DAV:` 的配额属性：没有根元素那道闸，它会被当成一条正常
+    配额响应读出来（退出码 0、"可用 222 B"），把一个不是 multistatus 的响应
+    静默当成了配额。
+    """
+    live_dav.quota_body = (
+        b'<?xml version="1.0" encoding="utf-8"?>'
+        b'<D:propfind xmlns:D="DAV:"><D:prop>'
+        b'<D:quota-available-bytes>222</D:quota-available-bytes>'
+        b'</D:prop></D:propfind>')
+
+    code, _, err = run(capsys, "quota")
+    assert code == nsdav.EXIT_ERROR
+    assert "服务端不支持配额查询" in err
+
+
+def test_quota_ignores_foreign_namespace_lookalikes(live_dav, capsys):
+    """成功路径：只认 `DAV:` 里的配额属性，同名外来属性一律不算数。"""
+    live_dav.quota_body = QUOTA_XML
+
+    code, out, _ = run(capsys, "quota")
+    assert code == 0
+    assert out.strip() == "可用 222 B，已用 444 B，合计 666 B"
+
+
+def test_quota_json_ignores_foreign_namespace_lookalikes(live_dav, capsys):
+    """`--json` 成功分支同样按命名空间取值。"""
+    live_dav.quota_body = QUOTA_XML
+
+    code, out, _ = run(capsys, "--json", "quota")
+    assert code == 0
+    assert json.loads(out) == {"available": 222, "used": 444}
+
+
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -4170,13 +4327,21 @@ def _quota_numbers(resp) -> tuple[int | None, int | None]:
         root = ET.fromstring(resp.body)
     except ET.ParseError as e:
         raise NsdavError(f"配额响应不是合法 XML: {e}")
+    if root.tag != f"{DAV}multistatus":
+        # 与 parse_multistatus 同一道把关：外层不是 multistatus 就不是配额
+        # 响应。回 (None, None)，交给 cmd_quota 那条"服务端不支持配额查询"
+        # 的报错路径 —— 这里静默返回就等于"配额为 0"，正是本文件反复在防的
+        # 那种静默失败。
+        return None, None
+    # 属性按**全名**比对（DAV 常量 + local name），不按 local name：`DAV:`
+    # 之外命名空间里同名的属性不算数。全局约束要求 XML 一律按命名空间解析，
+    # 不得用字符串匹配，本文件其它地方（parse_multistatus）就是这么做的。
     for el in root.iter():
-        tag = el.tag.rsplit("}", 1)[-1]
         if not el.text or not el.text.strip().isdigit():
             continue
-        if tag == "quota-available-bytes":
+        if el.tag == f"{DAV}quota-available-bytes":
             avail = int(el.text)
-        elif tag == "quota-used-bytes":
+        elif el.tag == f"{DAV}quota-used-bytes":
             used = int(el.text)
     return avail, used
 
@@ -4257,6 +4422,7 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
