@@ -496,7 +496,21 @@ def test_href_is_percent_decoded():
     <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'''
     e = nsdav.parse_multistatus(xml, "/dav")[0]
     assert e.path == "/中文/a b.txt"
-    assert e.name == "b.txt"
+    assert e.name == "a b.txt"
+
+
+def test_base_prefix_does_not_match_a_sibling_directory():
+    """base '/dav' 不能匹配 '/davos/x.txt'。
+
+    朴素前缀匹配会把 '/davos/x.txt' 切成 'os/x.txt' 再补成 '/os/x.txt'——
+    列表里的路径是错的，用户照着它 rm 就会打错目标。必须按整段边界比。
+    """
+    xml = b'''<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response>
+    <d:href>/davos/x.txt</d:href>
+    <d:propstat><d:prop><d:resourcetype/></d:prop>
+    <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'''
+    e = nsdav.parse_multistatus(xml, "/dav")[0]
+    assert e.path == "/davos/x.txt"
 
 
 def test_missing_size_and_mtime_are_tolerated():
@@ -580,7 +594,9 @@ def parse_multistatus(xml_bytes: bytes, base_path: str) -> list[Entry]:
             if f"{DAV}getlastmodified" in props else None
         )
 
-        if base and href.startswith(base):
+        # 按整段边界比，不能用朴素前缀：base '/dav' 会匹配上 '/davos/x'。
+        # href 恰好等于 base（自身那一条）时 rel 落成 ""，下面的补 '/' 会接管。
+        if base and (href == base or href.startswith(base + "/")):
             rel = href[len(base):]
         else:
             rel = href
