@@ -2943,12 +2943,17 @@ git commit -m "feat(transfer): 流式上传与大小/内容校验"
 - Test: `tests/test_config.py`
 
 **Interfaces:**
-- Consumes: 异常（T1）
+- Consumes: 异常（T1）、常量（T1/T7）
 - Produces:
-  - `@dataclass class Config(host, base_path, user, password, min_gap, max_retries, timeout, device_dir=None)`
-  - `load_config(args, env: Mapping[str, str] = os.environ) -> Config`
-  - `config_file_path() -> str`
+  - `@dataclass class Config(host, port, use_tls, base_path, user, password, min_gap=DEFAULT_MIN_GAP, max_retries=DEFAULT_MAX_RETRIES, timeout=DEFAULT_TIMEOUT)`
+  - `load_config(args, *, env: Mapping[str, str] | None = None, config: dict | None = None) -> Config`
+    —— `env`/`config` 都是**关键字参数**且可注入，测试靠它们保持无 IO。
+  - `config_file_path() -> str`、`_read_config_file(path=None) -> dict[str, str]`
+    —— 定义在本节 Step 3 的实现块里（`~/.config/nsdav/config.toml`，权限过宽时
+    往 stderr 告警），不是"忘了写"。
+  - `_split_url(url) -> (host, port, use_tls, base_path)`
   - 环境变量 `NSDAV_WEBDAV_URL` / `NSDAV_WEBDAV_USER` / `NSDAV_WEBDAV_PASSWORD`
+    （另有 `NSDAV_MIN_GAP` / `NSDAV_MAX_RETRIES` / `NSDAV_TIMEOUT`）
 
 **优先级（高 → 低）：** 命令行参数 → 环境变量 → 配置文件 → 内置默认。
 缺账号或密码时报 `AuthError`，消息里要说清楚三种设置途径。
