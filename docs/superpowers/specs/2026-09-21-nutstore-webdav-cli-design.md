@@ -75,7 +75,7 @@ Transport   http.client 长连接 + 预置 Basic 头
 WebDAV      协议操作
             ├── propfind(path, depth)   含 Link 分页循环
             ├── get(path, range)  put  mkcol  delete  move  copy
-            └── enc_path()              只编码路径段，query 原样保留
+            └── enc_path()              逐段编码，不认 query（见 §4）
     │
 Model       Entry(path, name, is_dir, size, mtime)
     │
