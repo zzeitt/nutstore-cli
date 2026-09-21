@@ -133,6 +133,7 @@ testpaths = tests
 markers =
     live: 需要真实坚果云账号，默认跳过
 addopts = -m "not live"
+
 ```
 
 - [ ] **Step 4: 写 nsdav.py 的前四节**
@@ -3812,9 +3813,10 @@ git commit -m "feat(config): 参数/环境变量/配置文件三级优先级"
 ```python
 """命令行层：argparse、cmd_* 分发、人类可读 / JSON 双输出。
 
-中间那一段是计划里 T12 的测试围栏，逐字节照抄。文末"围栏之外"一节是本
-任务在围栏之外补的三样东西：HOME 隔离 fixture，以及 P5 要求的 tree、quota
-两条用例（围栏只给了行为表，没有它们的用例代码）。
+中间那一段是计划里 T12 的测试围栏。文末"围栏之外"一节是围栏之后陆续补的
+夹具与用例：HOME 隔离 fixture，P5 要求的 tree / quota 用例（围栏只给了行为
+表，没有用例代码），修复轮 1 的 F1/F2，以及 `rm` 目录不带 `-r` 按用法错
+（2）退出这条。
 """
 import json
 import pytest
@@ -4083,6 +4085,27 @@ def test_quota_json_ignores_foreign_namespace_lookalikes(live_dav, capsys):
     assert json.loads(out) == {"available": 222, "used": 444}
 
 
+def test_rm_dir_without_recursive_is_a_usage_error(live_dav, capsys):
+    """目录不带 `-r`：CLI 层就当用法错（2）拦下，而不是 DELETE 失败后再报。
+
+    只断退出码是没有区分力的：旧实现由库里的守卫抛 NsdavError，退出码 1，
+    而一个"先发 DELETE、再返回 2"的实现同样是 2。所以还钉住 DELETE 一次都
+    没发出去、目录与里面的文件都还在。`--dry-run` 也走同一条路 —— 旧实现
+    在那种输入下会打印"将删除"并以 0 退出，承诺了一件真跑时必然做不到的事。
+    """
+    code, _, err = run(capsys, "rm", "/d")
+    assert code == nsdav.EXIT_USAGE
+    assert "-r" in err
+
+    code, out, _ = run(capsys, "--dry-run", "rm", "/d")
+    assert code == nsdav.EXIT_USAGE
+    assert "将删除" not in out
+
+    assert not [m for m, _ in live_dav.requests if m == "DELETE"]
+    assert "/d" in live_dav.dirs
+    assert "/d/one.txt" in live_dav.store
+
+
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -4273,11 +4296,22 @@ def cmd_mkdir(dav, args) -> int:
 
 def cmd_rm(dav, args) -> int:
     target = normalize_remote_path(args.path)
-    if not (args.recursive and dav.stat(target).is_dir):
+    # 带不带 -r 都要先 stat 一次：判"目标是目录"只此一途。短路掉的话，目录
+    # 不带 -r 会落到下面的 delete()，由 T8 的守卫抛 NsdavError 兜住 —— 那是
+    # 退出码 1（一般错误），而 README 的退出码表写着 2 = 用法错误，脚本按 2
+    # 分类用法错时就会误判。这是 CLI 层判得出来的用法问题，不是服务端的事。
+    is_dir = dav.stat(target).is_dir
+    if is_dir and not args.recursive:
+        # --dry-run 也走这条：那种输入下打印"将删除"是误导 —— 真跑必被拒，
+        # 而 dry-run 的承诺是"打印真跑会发生的事"。
+        raise UsageError(
+            f"{target} 是目录，删除目录需要 -r（协议里没有只删空目录的操作）")
+    if not is_dir:
+        # 文件：-r 给不给都照删。
         if args.dry_run:
             print(f"将删除 {target}")
             return EXIT_OK
-        dav.delete(target)              # 目录且非递归时 T8 的守卫会拒绝
+        dav.delete(target)
         return EXIT_OK
 
     # 递归删整棵树就是**一个** DELETE：RFC 4918 §9.6.1 规定对集合缺省
