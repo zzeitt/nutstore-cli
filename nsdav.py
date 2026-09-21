@@ -601,8 +601,13 @@ class WebDAV:
         entries = self.propfind(rel_path, depth="1")
         out = []
         for e in entries:
-            if e.path.rstrip("/") + ("/" if e.is_dir else "") == want:
-                continue            # 自身
+            # 自身条目一律排除。早先只比 `e.path + ("/" if is_dir)` 与带尾斜杠的
+            # want：目录目标能正确排除自己，目标若是**文件**则 depth=1 只返回它
+            # 自己、href 不带尾斜杠，于是被当成"自己的子项"返回，`listdir("f")`
+            # 得到 `[f]`、`walk("f")` 也把它 yield 出来。去掉两边尾斜杠再比，
+            # 两种目标都对：只有目标本身相等，子项一律不同。
+            if e.path.rstrip("/") == want.rstrip("/"):
+                continue
             out.append(e)
         return out
 
@@ -645,6 +650,19 @@ class WebDAV:
             self.mkcol("/" + "/".join(parts[:i]))
 
     def delete(self, rel_path: str, recursive: bool = False) -> None:
+        """删文件或目录。目标是目录时必须显式 `recursive=True`。
+
+        WebDAV 的 DELETE 对集合**缺省就是 `Depth: infinity`**（RFC 4918
+        §9.6.1），所以"不带 Depth 头"并不等于"只删空目录"——服务器照样删整棵
+        子树。实测（协议层 + mock 一致）：把下面那行 Depth 头整个去掉，89 条
+        用例全绿，而 `/d/a.txt` 连同 `/d/sub` 一起没了。协议里没有"删空目录"
+        这个操作，所以这个开关只能在客户端自己兜住：先看清目标是不是目录，
+        是就拒绝，让调用方明确说要递归。
+        """
+        if not recursive and self.stat(rel_path).is_dir:
+            raise NsdavError(
+                f"{rel_path} 是目录：DELETE 对集合缺省就是递归的，"
+                f"要删整棵子树请显式传 recursive=True")
         headers = {"Depth": "infinity"} if recursive else None
         self._expect(self.t.request(
             "DELETE", self.target(rel_path), headers=headers))

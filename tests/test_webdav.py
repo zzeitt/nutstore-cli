@@ -28,6 +28,9 @@ def test_listdir_excludes_self(dav):
     d.put("/a/two.txt", b"22")
     names = sorted(e.name for e in d.listdir("/a"))
     assert names == ["one.txt", "two.txt"]
+    # 目标本身是**文件**时，depth=1 只会返回它自己；它必须是空列表，
+    # 不能把自己当成自己的子项返回（那会让 `walk("f")` 把 f 吐出来）。
+    assert d.listdir("/a/one.txt") == [], [e.path for e in d.listdir("/a/one.txt")]
 
 
 def test_listdir_follows_pagination():
@@ -138,6 +141,26 @@ def test_delete_recursive(dav):
     assert not d.exists("/t")
 
 
+def test_delete_directory_requires_recursive(dav):
+    """recursive=False 撞上目录必须拒绝，且**一个字节都不能删**。
+
+    这条用例盯着的是"用例无法为它名字里的行为而失败"那类漏子：上面那条
+    `test_delete_recursive` 删的是 recursive=True，而 recursive=False 这半边
+    从来没人走过。实测把 delete 里那行 Depth 头整个去掉（等于开关失效），
+    89 条全绿，`/t/a.txt` 和 `/t/sub` 却被一起删光了——mock 和 RFC 4918 §9.6.1
+    一样，集合缺省就是 infinity。所以断言分两段：先拒绝，再确认什么都没少。
+    """
+    s, base = dav
+    d = _dav(s, base)
+    d.mkcol("/d"); d.mkcol("/d/sub"); d.put("/d/a.txt", b"1")
+    with pytest.raises(nsdav.NsdavError):
+        d.delete("/d")
+    assert d.exists("/d/a.txt"), "拒绝之前就把东西删了"
+    assert d.exists("/d/sub"), "拒绝之前就把子目录删了"
+    d.delete("/d", recursive=True)
+    assert not d.exists("/d/a.txt")
+
+
 def test_move_and_copy(dav):
     s, base = dav
     d = _dav(s, base)
@@ -163,3 +186,20 @@ def test_walk_depth_limited(dav):
     shallow = [e.path for e in d.walk("/w", max_depth=1)]
     assert "/w/f.txt" in shallow and "/w/sub/" in shallow
     assert "/w/sub/g.txt" not in shallow
+
+
+def test_walk_unlimited_depth(dav):
+    """max_depth=0（默认值，文档写明"不限深度"）必须真的递归下去。
+
+    此前 12 条里 walk 的递归下降一次都没被执行过：上面那条只走 max_depth=1，
+    实测把递归条件改成 `if False:` 依然全量绿（89 passed），而改成无脑
+    `if e.is_dir:` 只有上面那一条红。也就是说 `queue.append` / `depth + 1` /
+    队列消费整段没人看，默认值本身也零覆盖。这条用例走默认值、下到第三层。
+    """
+    s, base = dav
+    d = _dav(s, base)
+    d.mkcol("/w"); d.mkcol("/w/sub"); d.mkcol("/w/sub/deep")
+    d.put("/w/sub/deep/x.txt", b"3")
+    paths = [e.path for e in d.walk("/w")]
+    assert "/w/sub/" in paths, paths
+    assert "/w/sub/deep/x.txt" in paths, paths
