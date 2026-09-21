@@ -24,6 +24,8 @@
 - XML 必须按命名空间解析，`DAV:` 前缀绑定为 `{DAV:}`。不得用字符串匹配。
 - 退出码：`0` 成功 / `1` 一般错误 / `2` 用法错 / `3` 认证失败 / `4` 未找到 / `5` 被限流 / `6` 网络错误。
 - 提交信息遵循 Conventional Commits + 3Cs 骨架（`Changes` / `Context` / `Considerations`），subject ≤ 60 字符，body 每行 ≤ 72 字符。
+- **计划里的代码围栏与仓库文件是同一份东西**：每个实现/测试围栏就是对应文件的一段**连续切片**。把同一个文件的所有围栏按出现顺序用两个空行拼接起来，应当逐字节等于该文件（文件末尾的换行含在最后一个围栏里）。首行是说明性中文注释、文件里根本不存在的那种围栏是"插入位置提示"，不是文件内容，别当切片。
+- 任务正文里"修复轮 N"的叙述是**历史记录**，围栏才是当前实现；两者不一致时以围栏为准。这些围栏已按修复后的仓库重写过（最后一次在 T11 修复轮 3 之后）。
 
 ---
 
@@ -114,6 +116,7 @@ def test_enc_path_has_no_query_concept():
 ])
 def test_normalize_remote_path(raw, expected):
     assert nsdav.normalize_remote_path(raw) == expected
+
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -142,18 +145,19 @@ addopts = -m "not live"
 """
 from __future__ import annotations
 
-import argparse
 import base64
 import email.utils
 import http.client
-import json
+import math
 import os
 import random
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timezone
 from typing import Any, BinaryIO, Callable, Iterator, NamedTuple
 from urllib.parse import quote, unquote, urlsplit
 
@@ -331,6 +335,35 @@ def test_url_to_target_keeps_query_encoded():
 
 def test_url_to_target_without_query():
     assert nsdav.url_to_target("https://h/dav/a/b") == "/dav/a/b"
+
+
+def test_comma_inside_angle_brackets_does_not_split():
+    h = '<https://h/a,b>; rel="next", <https://h/c>; rel="last"'
+    assert nsdav.parse_next_link(h) == "https://h/a,b"
+
+
+def test_unquoted_rel_token_is_accepted():
+    assert nsdav.parse_next_link('<https://h/b>; rel=next') == "https://h/b"
+
+
+def test_stray_gt_does_not_disable_later_splitting():
+    h = 'junk> garbage, <https://h/b>; rel="next"'
+    assert nsdav.parse_next_link(h) == "https://h/b"
+
+
+def test_rel_relation_type_is_case_insensitive():
+    """RFC 8288 §2.1.1：注册关系类型逐字符不区分大小写比较。
+
+    漏掉这种变体和漏掉裸 token 是同一类静默丢分页。
+    """
+    assert nsdav.parse_next_link('<https://h/b>; rel="Next"') == "https://h/b"
+    assert nsdav.parse_next_link('<https://h/b>; rel=NEXT') == "https://h/b"
+
+
+def test_rel_inside_another_quoted_value_is_not_a_match():
+    """引号内的 rel=next 不是参数，不能误判。"""
+    assert nsdav.parse_next_link('<https://h/x>; title="a; rel=next"') is None
+
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -357,7 +390,9 @@ def _split_link_values(header: str) -> list[str]:
         elif ch == "<" and not in_quotes:
             depth += 1
         elif ch == ">" and not in_quotes:
-            depth -= 1
+            # 钳在 0：多余的 '>' 若让 depth 变负，后面每个逗号都判不出
+            # depth == 0，整条头会塌成一段，分页链接就静默丢了
+            depth = max(0, depth - 1)
         if ch == "," and depth == 0 and not in_quotes:
             out.append("".join(buf))
             buf = []
@@ -369,7 +404,15 @@ def _split_link_values(header: str) -> list[str]:
 
 
 def parse_next_link(header: str | None) -> str | None:
-    """从 Link 头里取出 rel="next" 的 URL，没有就返回 None。"""
+    """从 Link 头里取出 rel="next" 的 URL，没有就返回 None。
+
+    rel 的值按 RFC 8288 既可以是 quoted-string，也可以是裸 token
+    （rel=next）。两种都必须认：漏掉裸 token 那种就是静默丢分页 ——
+    目录超过 750 条时会少列文件，而且没有任何信号告诉用户。
+
+    RFC 8288 §2.1.1 还要求注册关系类型逐字符不区分大小写比较，所以
+    rel="Next" 同样算 next；参数名与参数值都不区分大小写。
+    """
     if not header:
         return None
     for part in _split_link_values(header):
@@ -377,8 +420,9 @@ def parse_next_link(header: str | None) -> str | None:
         if not m:
             continue
         url, params = m.group(1), m.group(2)
-        for pm in re.finditer(r'(\w+)\s*=\s*"([^"]*)"', params):
-            if pm.group(1).lower() == "rel" and "next" in pm.group(2).split():
+        for pm in re.finditer(r'(\w+)\s*=\s*("[^"]*"|[^\s;,"]+)', params):
+            value = pm.group(2).strip('"').lower()
+            if pm.group(1).lower() == "rel" and "next" in value.split():
                 return url
     return None
 
@@ -605,6 +649,7 @@ def test_missing_size_and_mtime_are_tolerated():
 def test_dir_path_keeps_trailing_slash():
     d = nsdav.parse_multistatus(TWO_ITEMS, "/dav")[0]
     assert d.path.endswith("/")
+
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -799,6 +844,7 @@ def test_jitter_stays_within_bounds():
     hi = nsdav.backoff_delay(3, 503, rand=lambda: 1.0)
     assert lo == 8.0 * 0.75
     assert hi == 8.0 * 1.25
+
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -968,6 +1014,7 @@ def test_zero_gap_disables_throttling():
     rl.wait()
     rl.wait()
     assert c.slept == []
+
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1047,7 +1094,7 @@ import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 BASE_PATH = "/dav"
 
@@ -1059,6 +1106,10 @@ class MockDAV:
         self._fail_first_n = fail_first_n
         self.fail_status = fail_status
         self.latency = latency
+        # 关掉 Range 支持：带 Range 的 GET 一律回 200 全量，模拟不支持范围
+        # 请求的服务器。T9 的续传必须能从这种回退里恢复（关键点之一，
+        # 但在此之前没有任何用例走到过那条分支）。
+        self.ignore_range = False
         self.user = user
         self.password = password
         self.store: dict[str, bytes] = {}
@@ -1147,7 +1198,7 @@ class MockDAV:
                     return
                 data = outer.store[rel]
                 rng = self.headers.get("Range")
-                if rng:
+                if rng and not outer.ignore_range:
                     m = re.match(r"bytes=(\d+)-(\d*)", rng)
                     if m:
                         start = int(m.group(1))
@@ -1348,6 +1399,7 @@ class MockDAV:
 
     def add_file(self, path: str, data: bytes) -> None:
         self.store[path] = data
+
 ```
 
 注意 `quote` 需要从 `urllib.parse` 一并 import。
@@ -1579,6 +1631,7 @@ def test_mock_fail_first_n_can_be_set_after_start():
         assert _req(base, "PROPFIND", "/dav/", headers={"Depth": "0"})[0] == 207
     finally:
         s.stop()
+
 ```
 
 - [ ] **Step 3: 跑测试**
@@ -1824,6 +1877,7 @@ def test_stream_body_retry_reopens_file(tmp_path, dav):
     r = t.request("PUT", "/dav/f.bin", body=body)
     assert r.status == 201
     assert s.store["/f.bin"] == b"abcdef"   # 重试后内容完整，不是空的
+
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -2085,10 +2139,13 @@ DELETE 对集合缺省就是 `Depth: infinity`（RFC 4918 §9.6.1），协议里
 `tests/test_webdav.py`：
 
 ```python
+import dataclasses
+
 import pytest
 
 import nsdav
 from mock_dav import MockDAV
+from nsdav import normalize_remote_path
 
 
 @pytest.fixture
@@ -2290,6 +2347,48 @@ def test_walk_unlimited_depth(dav):
     paths = [e.path for e in d.walk("/w")]
     assert "/w/sub/" in paths, paths
     assert "/w/sub/deep/x.txt" in paths, paths
+
+
+def test_delete_plain_file_without_recursive(dav):
+    # 守卫只该拦目录。文件走的是最常见的分支，此前一条用例都没碰它。
+    s, base = dav
+    d = _dav(s, base)
+    s.add_file("/f.txt", b"x")
+
+    d.delete("/f.txt")
+
+    assert "/f.txt" not in s.store
+
+
+def test_delete_root_without_recursive_is_refused(dav):
+    # 根目录是目录，非递归就该拒绝——顺带钉住"拒绝时什么都没删"。
+    s, base = dav
+    d = _dav(s, base)
+    s.add_file("/a.txt", b"x")
+
+    with pytest.raises(nsdav.NsdavError, match="是目录"):
+        d.delete("/", recursive=False)
+
+    assert "/a.txt" in s.store
+
+
+def test_walk_terminates_when_a_directory_lists_itself(dav):
+    # 服务端把目录自己当成它的子项报回来时，walk 必须能返回。
+    # 注意这条用例失败的样子是"挂起"而不是"报错"：没有 visited 集合时
+    # 它无限入队，pytest 不会红，只会一直转。
+    s, base = dav
+    d = _dav(s, base)
+    d.mkdirs("/loop")
+    real = d.stat("/loop")
+
+    def loopy(rel_path, depth="1"):
+        cur = normalize_remote_path(rel_path)
+        return [dataclasses.replace(real, path=cur)]
+
+    d.listdir = loopy
+
+    assert len(list(d.walk("/loop"))) == 1
+
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -2383,10 +2482,21 @@ class WebDAV:
         return resp.body
 
     def walk(self, rel_path: str, max_depth: int = 0) -> Iterator[Entry]:
-        """广度优先递归。max_depth=0 表示不限深度。"""
+        """广度优先递归。max_depth=0 表示不限深度。
+
+        seen 记录已经列过的目录。服务端把某个祖先当成自己的子项报回来时
+        （同一目录的两种拼写就会这样，`listdir` 的自过滤按规范化路径比，
+        拼写一不同就漏过去），没有它这里会无限入队：不报错、不返回，直接把
+        进程挂死。实测：把自过滤改成永不命中，整个测试套件就停不下来。
+        """
         queue = [(normalize_remote_path(rel_path), 1)]
+        seen: set[str] = set()
         while queue:
             cur, depth = queue.pop(0)
+            key = cur.rstrip("/") or "/"
+            if key in seen:
+                continue
+            seen.add(key)
             for e in self.listdir(cur):
                 yield e
                 if e.is_dir and (max_depth == 0 or depth < max_depth):
@@ -2514,6 +2624,7 @@ Range"那条分支 —— 不然那条分支的用例是空转的（mock 永远�
 import contextlib
 import os
 import pytest
+import random
 
 import nsdav
 from mock_dav import MockDAV
@@ -3101,6 +3212,7 @@ def test_strong_verify_over_range_reads_only_the_tail(dav, tmp_path):
     sizes = [x for sp in spies for x in sp.sizes]
     assert sizes, "一次 read 都没有？"
     assert len(sizes) <= 2, sizes
+
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -3424,15 +3536,20 @@ def _number(value, cast, name: str, *, minimum=None, exclusive=False):
     """配置文件里数值也是字符串，统一在这里转，并给出可读的报错。
 
     `minimum` 给出下限：默认"不能小于"，`exclusive=True` 时"必须大于"。
+    inf / nan 这样的非有限值一律拒绝 —— 它们能穿过上下限比较，最后在
+    `socket.settimeout` 那里变成 OverflowError / ValueError。
     """
     try:
         n = cast(value)
     except (TypeError, ValueError) as e:
         raise UsageError(f"配置项 {name} 不是合法数值: {value!r}") from e
+    if isinstance(n, float) and not math.isfinite(n):
+        raise UsageError(f"配置项 {name} 必须是有限数值: {value!r}")
     if minimum is not None and (n <= minimum if exclusive else n < minimum):
         rel = "必须大于" if exclusive else "不能小于"
         raise UsageError(f"配置项 {name} {rel} {minimum}: {value!r}")
     return n
+
 ```
 
 在 `tests/test_config.py` 里补一条覆盖配置文件路径的用例：
@@ -3561,17 +3678,34 @@ def test_bad_port_is_usage_error_not_valueerror(bad):
         nsdav.load_config(Args(url=bad), env={}, config={})
 
 
-@pytest.mark.parametrize("key,value", [
-    ("NSDAV_MIN_GAP", "-1"),
-    ("NSDAV_MAX_RETRIES", "-1"),
-    ("NSDAV_TIMEOUT", "0"),
-    ("NSDAV_TIMEOUT", "-5"),
-])
-def test_out_of_range_numbers_are_usage_errors(key, value):
-    """三个旋钮的下限：min_gap/max_retries 不能小于 0，timeout 必须大于 0。"""
-    env = {"NSDAV_WEBDAV_USER": "u", "NSDAV_WEBDAV_PASSWORD": "p", key: value}
+_RANGE_CASES = [
+    # (env 键, config 键, Args 键, 文本值, 命令行值)
+    ("NSDAV_MIN_GAP", "min_gap", "min_gap", "-1", -1.0),
+    ("NSDAV_MAX_RETRIES", "max_retries", "max_retries", "-1", -1),
+    ("NSDAV_TIMEOUT", "timeout", "timeout", "0", 0.0),
+    ("NSDAV_TIMEOUT", "timeout", "timeout", "-5", -5.0),
+]
+
+_CRED = {"NSDAV_WEBDAV_USER": "u", "NSDAV_WEBDAV_PASSWORD": "p"}
+
+
+@pytest.mark.parametrize("source", ["cli", "env", "config"])
+@pytest.mark.parametrize("env_key,cfg_key,arg_key,text,cli_value", _RANGE_CASES)
+def test_out_of_range_numbers_are_usage_errors(
+        source, env_key, cfg_key, arg_key, text, cli_value):
+    """越界值从三个来源进来都要报 UsageError。
+
+    校验是单点收口（`pick` → `_number`），这条用例按来源参数化就是钉住"单点"这件事：
+    任何"某个来源跳过校验"的实现都会在这里红。
+    """
+    if source == "cli":
+        args, env, cfg = Args(**{arg_key: cli_value}), _CRED, {}
+    elif source == "env":
+        args, env, cfg = Args(), dict(_CRED, **{env_key: text}), {}
+    else:
+        args, env, cfg = Args(), _CRED, {cfg_key: text}
     with pytest.raises(nsdav.UsageError):
-        nsdav.load_config(Args(), env=env, config={})
+        nsdav.load_config(args, env=env, config=cfg)
 
 
 def test_version_gate_warns_and_ignores_config(tmp_path, monkeypatch, capsys):
@@ -3591,6 +3725,37 @@ def test_config_file_path_falls_back_to_dot_config(monkeypatch):
     # 分隔符交给 os.path.join：本仓库在 Windows 上跑，硬编 "/" 会红。
     assert nsdav.config_file_path() == os.path.join(
         "/fake/home", ".config", "nsdav", "config.toml")
+
+
+# ── 修复轮 2：范围化复审提出的洞 ──
+
+@pytest.mark.parametrize("source", ["cli", "env", "config"])
+@pytest.mark.parametrize("bad", ["inf", "-inf", "nan"])
+def test_non_finite_numbers_are_usage_errors(source, bad):
+    """inf / nan 能穿过上下限比较，三个来源都必须在入口被拒。
+
+    cli 那组喂的是真正的 float —— T12 的 argparse 就是 `--timeout type=float`，
+    所以"只在字符串来源上做有限性检查"这类变异必须在这里红。
+    """
+    if source == "cli":
+        args, env, cfg = Args(timeout=float(bad)), _CRED, {}
+    elif source == "env":
+        args, env, cfg = Args(), dict(_CRED, **{"NSDAV_TIMEOUT": bad}), {}
+    else:
+        args, env, cfg = Args(), _CRED, {"timeout": bad}
+    with pytest.raises(nsdav.UsageError):
+        nsdav.load_config(args, env=env, config=cfg)
+
+
+@pytest.mark.parametrize("bad", ["https://", "http:///dav"])
+def test_url_without_host_is_usage_error(bad):
+    """解析不出主机名要报 UsageError（exit 2），不是让 None 流进 Transport。
+
+    显式传齐凭据：这样它只钉 `_split_url` 的"没有主机名"分支，
+    不额外依赖"URL 检查排在凭据检查之前"这个顺序。
+    """
+    with pytest.raises(nsdav.UsageError):
+        nsdav.load_config(Args(url=bad), env=_CRED, config={})
 
 ```
 
