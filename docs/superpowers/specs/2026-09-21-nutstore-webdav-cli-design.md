@@ -228,15 +228,32 @@ nutstore-cli/
 ├── AGENTS.md            给 AI 和协作者的仓库说明
 ├── README.md            用法
 ├── LICENSE              AGPL-3.0
+├── .gitignore
 ├── nsdav.py             单文件 CLI（唯一的运行产物）
 ├── pytest.ini
 ├── tests/
-│   ├── mock_dav.py      进程内 mock WebDAV 服务器
-│   ├── test_paths.py
-│   ├── test_paginate.py
-│   ├── test_retry.py
-│   ├── test_propfind.py
-│   ├── test_download.py
-│   └── test_live.py     实测，默认跳过
-└── docs/superpowers/specs/   本文件
+│   ├── mock_dav.py           进程内 mock WebDAV 服务器
+│   ├── test_paths.py         enc_path / normalize_remote_path
+│   ├── test_link.py          Link 头解析
+│   ├── test_propfind.py      multistatus 解析
+│   ├── test_retry.py         退避
+│   ├── test_ratelimit.py     限流器
+│   ├── test_mock_sanity.py   mock 服务器自检
+│   ├── test_transport.py     Transport
+│   ├── test_webdav.py        WebDAV 操作层
+│   ├── test_transfer.py      下载 / 上传
+│   ├── test_config.py        配置优先级
+│   ├── test_cli.py           端到端走 main()
+│   └── test_live.py          实测，默认跳过
+└── docs/superpowers/         规格与实现计划
 ```
+
+## 11. 实现期对规格的修订
+
+写实现计划时发现下面几处规格本身不够准确，按此修订，实现以修订后为准。
+
+| 原规格 | 修订 | 理由 |
+|---|---|---|
+| §6.3 重试"1s 起" | 连接错误与普通 5xx 从 0.5s 起，429/503 从 2s 起 | 429/503 是服务端明确要求降速的信号，退避起步该更保守；连接抖动则不必等那么久 |
+| §6.9 "所有 sleep 走同一个可打断的等待函数" | 不加包装，直接用 `time.sleep` | Python 的 `time.sleep` 本来就立刻响应 `KeyboardInterrupt`，插件那种"不可中断"是 JS 的问题，Python 侧不存在 |
+| §7 "3.10 及以下降级为 key=value 格式" | 不支持 3.10，版本下限提到 3.11 | `tomllib` 是 3.11 才有的；iSH 与 a-Shell 上的 python3 都已是 3.11+，多写一套解析器属于 YAGNI |

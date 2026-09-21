@@ -884,6 +884,9 @@ class MockDAV:
                 outer.requests.append((method, self.path))
                 if outer.latency:
                     time.sleep(outer.latency)
+                # 无论走哪条分支，都必须先把请求体读干净，否则 body 留在
+                # socket 里，keep-alive 的下一个请求会读到脏数据。
+                body = self._read_body()
                 if not outer._check_auth(self.headers.get("Authorization")):
                     self._simple(401)
                     return
@@ -891,7 +894,7 @@ class MockDAV:
                     outer._failures_left -= 1
                     self._simple(outer.fail_status)
                     return
-                getattr(self, f"_do_{method.lower()}", self._unsupported)()
+                getattr(self, f"_do_{method.lower()}", self._unsupported)(body)
 
             do_GET = lambda self: self._dispatch("GET")
             do_PUT = lambda self: self._dispatch("PUT")
@@ -923,7 +926,8 @@ class MockDAV:
                 return self.rfile.read(n) if n else b""
 
             # ── 方法实现 ──
-            def _do_get(self):
+            # 每个方法都收 body（已在 _dispatch 里读完），用不到的忽略。
+            def _do_get(self, body):
                 rel = self._rel()
                 if rel not in outer.store:
                     self._simple(404)
@@ -944,20 +948,19 @@ class MockDAV:
                         return
                 self._simple(200, data, {"Accept-Ranges": "bytes"})
 
-            def _do_head(self):
+            def _do_head(self, body):
                 # 刻意模仿坚果云：永远返回 Content-Length: 0
                 self.send_response(200)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
-            def _do_put(self):
+            def _do_put(self, body):
                 rel = self._rel()
-                body = self._read_body()
                 existed = rel in outer.store
                 outer.store[rel] = body
                 self._simple(204 if existed else 201)
 
-            def _do_mkcol(self):
+            def _do_mkcol(self, body):
                 rel = self._rel().rstrip("/") or "/"
                 if rel in outer.dirs:
                     self._simple(405)
@@ -969,7 +972,7 @@ class MockDAV:
                 outer.dirs.add(rel)
                 self._simple(201)
 
-            def _do_delete(self):
+            def _do_delete(self, body):
                 rel = self._rel()
                 depth = (self.headers.get("Depth") or "infinity").lower()
                 if rel in outer.store:
@@ -991,7 +994,7 @@ class MockDAV:
                     return
                 self._simple(404)
 
-            def _do_move(self):
+            def _do_move(self, body):
                 src = self._rel()
                 dest = unquote(urlsplit(self.headers.get("Destination", "")).path)
                 if not dest.startswith(BASE_PATH):
@@ -1007,7 +1010,7 @@ class MockDAV:
                 outer.store[dst] = outer.store.pop(src)
                 self._simple(201)
 
-            def _do_copy(self):
+            def _do_copy(self, body):
                 src = self._rel()
                 dest = unquote(urlsplit(self.headers.get("Destination", "")).path)
                 dst = dest[len(BASE_PATH):] or "/"
@@ -1017,7 +1020,7 @@ class MockDAV:
                 outer.store[dst] = outer.store[src]
                 self._simple(201)
 
-            def _do_propfind(self):
+            def _do_propfind(self, body):
                 rel = self._rel()
                 depth = (self.headers.get("Depth") or "1").lower()
                 if rel in outer.store:
@@ -1037,6 +1040,10 @@ class MockDAV:
                 else:
                     self._simple(404)
                     return
+
+                # 必须整体排序：marker 分页靠的是"取路径大于 mk 的那些"，
+                # 若列表是"先目录后文件"而不是全局有序，翻页会漏条目。
+                items.sort(key=lambda i: i[0])
 
                 # 分页：marker 是上一页最后一项的路径
                 q = urlsplit(self.path).query
@@ -1079,7 +1086,7 @@ class MockDAV:
                 parts.append("</d:multistatus>")
                 return "".join(parts).encode()
 
-            def _unsupported(self):
+            def _unsupported(self, body):
                 self._simple(501)
 
         self._srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -2010,8 +2017,6 @@ def download(dav, remote_path, local_path, *, chunk=DOWNLOAD_CHUNK,
     写 <目标>.part，全部就绪后原子改名。已有 .part 时断点续传。
     返回 (本地路径, 字节数)。
     """
-    from urllib.parse import urlsplit
-
     entry = dav.stat(remote_path)
     if entry.is_dir:
         raise NsdavError(f"{remote_path} 是目录，不能下载")
@@ -2160,10 +2165,15 @@ def test_upload_strong_verify_detects_corruption(dav, tmp_path):
     src = tmp_path / "u.txt"
     payload = b"abcdefghij" * 10
     src.write_bytes(payload)
-    nsdav.upload(d, str(src), "/u.txt", verify="strong")
 
-    s.store["/u.txt"] = b"XXXXXXXXXX" + payload[10:]   # 篡改开头
-    with pytest.raises(nsdav.NsdavError):
+    # 让 PUT 写完就篡改内容，长度不变 —— 只有 strong 校验能发现
+    real_put = d.put
+    def corrupting_put(p, data):
+        real_put(p, data)
+        s.store[p] = b"XXXXXXXXXX" + payload[10:]
+    d.put = corrupting_put
+
+    with pytest.raises(nsdav.NsdavError, match="校验失败"):
         nsdav.upload(d, str(src), "/u.txt", verify="strong")
 
 
