@@ -1964,10 +1964,23 @@ def test_mkdirs_creates_parents(dav):
 
 
 def test_put_creates_parents_on_conflict(dav):
+    """PUT 撞 409 之后要**真的**把父目录建出来。
+
+    这条原来只断言 `d.read(...) == b"v"`——而 mock 当初无条件回 201、无条件
+    把内容存进 store，所以 `mkdirs` 那段一次都没跑过，这条照样绿。名字里写的
+    是"on_conflict"，断言里却没有任何东西依赖那个冲突发生过。必须断言父目录
+    **存在**，那才是被检验的行为。
+
+    `assert not d.exists("/deep")` 是前置条件，不是凑数：它保证后面的 409
+    确实是撞出来的，而不是这颗树碰巧已经在了。
+    """
     s, base = dav
     d = _dav(s, base)
-    d.put("/deep/nested/f.txt", b"v")     # 父目录不存在，应自动建
+    assert not d.exists("/deep")
+    d.put("/deep/nested/f.txt", b"v")
     assert d.read("/deep/nested/f.txt") == b"v"
+    assert d.stat("/deep").is_dir
+    assert d.stat("/deep/nested").is_dir
 
 
 def test_delete_recursive(dav):
@@ -2422,6 +2435,8 @@ def test_upload_creates_parents(dav, tmp_path):
     src.write_bytes(b"x")
     nsdav.upload(d, str(src), "/deep/dir/u.txt")
     assert s.store["/deep/dir/u.txt"] == b"x"
+    # mock 现在对"父集合不存在"回 409，所以这条同时真的走过了 put 的补建重试。
+    assert "/deep" in s.dirs and "/deep/dir" in s.dirs
 
 
 def test_upload_verifies_size(dav, tmp_path, monkeypatch):
