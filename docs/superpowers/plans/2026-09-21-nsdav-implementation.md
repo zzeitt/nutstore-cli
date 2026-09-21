@@ -2890,8 +2890,13 @@ git commit -m "feat(transfer): 分块下载与断点续传"
 - `StreamBody` 的 factory 让重试能重新打开文件（T7 已测）。
 - 传完用 **PROPFIND** 核对大小 —— 不是 HEAD（坚果云 HEAD 恒返回 0）。
 - `verify="strong"` 时读回末尾 64 字节比对。
+- 回读校验**按块读**、只留末尾 `tail` 字节的滚动窗口 —— 服务端回 `200`
+  （忽略 Range）时整份文件都在流里，整份 `read()` 会把它全读进内存。
 
 - [ ] **Step 1: 写失败的测试**
+
+**承 T9：** `tests/test_transfer.py` 里已经有 `_ReadSpy` / `_spy_stream`
+两个 helper（T9 加的），本节用例直接复用，别再定义一遍。
 
 追加到 `tests/test_transfer.py`：
 
@@ -2976,6 +2981,31 @@ def test_upload_does_not_read_whole_file_into_memory(dav, tmp_path):
     d.put = spy
     nsdav.upload(d, str(src), "/big.bin")
     assert seen == ["StreamBody"]
+
+
+def test_strong_verify_streams_when_server_ignores_range(dav, tmp_path):
+    """服务端忽略 Range（回 200 全量）时，回读校验只留末尾的 tail 字节。
+
+    这条路此前一个用例都走不到（mock 默认支持 Range），而它明确承认 200 是
+    合法响应。整份 `read()` 会把远端文件全读进内存 —— 与 T9 回退分支同一个
+    坑。断言两层：任何一次 read 都带正数长度（形状），以及"内容对得上时不
+    误报"（滚动窗口必须留**末尾**；只留开头会在这里假报警）。
+    """
+    s, base = dav
+    d, t = _dav(s, base)
+    payload = bytes(range(256)) * 32768          # 8 MiB
+    src = tmp_path / "big.bin"
+    src.write_bytes(payload)
+    s.add_file("/big.bin", payload)              # 远端内容与本地一致
+    s.ignore_range = True
+    spies = _spy_stream(t)
+
+    n = nsdav.upload(d, str(src), "/big.bin", verify="strong")
+
+    assert n == len(payload)
+    sizes = [x for sp in spies for x in sp.sizes]
+    assert sizes, "一次 read 都没有？"
+    assert all(isinstance(x, int) and x > 0 for x in sizes), sizes
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -3023,7 +3053,16 @@ def upload(dav, local_path, remote_path, *, verify="size",
                           headers={"Range": f"bytes={start}-{size - 1}"}) as r:
             if r.status not in (200, 206):
                 raise NsdavError(f"回读校验失败：HTTP {r.status}")
-            remote_tail = r.body.read()
+            # 200 = 服务端忽略 Range，整个文件都回了过来；206 = 只回我们要的尾巴。
+            # 两种都只留最后 tail 字节的滚动窗口 —— 整份 read() 会把远端文件全
+            # 读进内存，而这条路本来就承认 200 是合法响应（iSH 上内存比时间金贵，
+            # T9 的回退分支踩过同一个坑）。200 那条路上，尾巴在流的末尾。
+            remote_tail = b""
+            while True:
+                buf = r.body.read(65536)
+                if not buf:
+                    break
+                remote_tail = (remote_tail + buf)[-tail:]
         if remote_tail[-tail:] != local_tail:
             raise NsdavError(
                 f"上传内容校验失败：{remote_path} 末尾字节与本地不一致")
