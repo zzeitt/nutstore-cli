@@ -205,8 +205,20 @@ def parse_multistatus(xml_bytes: bytes, base_path: str) -> list[Entry]:
 
     base_path 是 WebDAV 根的路径前缀（如 '/dav'），解析出的 Entry.path
     相对该前缀。响应里的 href 是百分号编码的，这里解码。
+
+    响应体不是合法 XML、或根元素不是 {DAV:}multistatus 时抛 NsdavError。
+    这两种情况下继续解析都会得到空列表，而空列表被上层当成"空目录"，
+    正是本项目要避免的静默失败。
     """
-    root = ET.fromstring(xml_bytes)
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as exc:
+        raise NsdavError(f"响应不是合法 XML: {exc}") from exc
+    if root.tag != f"{DAV}multistatus":
+        raise NsdavError(
+            f"响应根元素是 {root.tag!r}，不是 {DAV}multistatus"
+            " —— 服务器没有按 WebDAV 返回，继续解析只会得到空列表"
+        )
     base = base_path.rstrip("/")
     out: list[Entry] = []
 
