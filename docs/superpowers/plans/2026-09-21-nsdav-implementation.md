@@ -479,28 +479,46 @@ def test_empty_multistatus():
 def test_ignores_propstat_that_is_not_200():
     """404 的 propstat 一个属性都不许贡献。
 
-    这里两个断言是配对设计的，缺一个就抓不住 bug：
+    第二个 response 的块顺序是**刻意反过来**的，别把它"理顺"。两种顺序都要
+    有，因为不同的错法埋伏在不同的顺序里；只留一种顺序就等于给另一种错法留
+    后门。下面每条都在讲它挡的是哪种实现：
 
-    - `getcontentlength` 在 404 块里是 777、在 200 块里是 99，且 404 块在后。
-      "后写的盖前面"那种合并实现会得到 777。
-    - `getlastmodified` 只出现在 404 块里。"先写的赢"那种合并实现在 200 块
-      里找不到它，仍会退到 404 块，于是 mtime 不为 None。
+    - `/after`（200 在前、404 在后）：`getcontentlength` 在 404 块里是 777、
+      200 块里是 99。"后写的盖前面"那种合并实现拿到 777。
+    - `/before`（404 在前、200 在后）：只看第一个 propstat 的实现（`resp.find`
+      而不是 `findall`）在这里只会看到 404 块——不看 status 的版本拿到 777，
+      看 status 的版本直接跳过、什么都拿不到，于是 size 落成 0。两种都露馅。
+    - 两台都带 `getlastmodified`，而它只该来自 200 块："先写的赢"那种合并在
+      200 块里找不到它，会退到 404 块，于是 mtime 不为 None。
 
-    只放一个冲突值只能抓住其中一种合并顺序——第一版就只放了一个
-    `getcontentlength`，而 404 块里没有它，于是一份"完全不看 status"的实现
-    照样通过，测试对它所命名的行为完全无感。
+    这个用例改过两轮，历史值得留着：第一版 404 块里只有 `resourcetype`，对
+    `size` 毫无影响，一份完全不看 status 的合并实现照样通过；第二版把 404 块
+    一律挪到后面，补上了合并这一类，却又放走了 `resp.find` 那一类——同一份
+    "不看 status"的缺陷换个形状就隐形了。收窄顺序覆盖不是免费的。
     """
-    xml = b'''<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response>
-    <d:href>/dav/x</d:href>
+    xml = b'''<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+    <d:response>
+    <d:href>/dav/after</d:href>
     <d:propstat><d:prop><d:getcontentlength>99</d:getcontentlength></d:prop>
       <d:status>HTTP/1.1 200 OK</d:status></d:propstat>
     <d:propstat><d:prop><d:resourcetype/><d:getcontentlength>777</d:getcontentlength>
       <d:getlastmodified>Mon, 21 Sep 2026 08:03:53 GMT</d:getlastmodified></d:prop>
       <d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>
-    </d:response></d:multistatus>'''
-    e = nsdav.parse_multistatus(xml, "/dav")[0]
-    assert e.size == 99
-    assert e.mtime is None
+    </d:response>
+    <d:response>
+    <d:href>/dav/before</d:href>
+    <d:propstat><d:prop><d:resourcetype/><d:getcontentlength>777</d:getcontentlength>
+      <d:getlastmodified>Mon, 21 Sep 2026 08:03:53 GMT</d:getlastmodified></d:prop>
+      <d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>
+    <d:propstat><d:prop><d:getcontentlength>99</d:getcontentlength></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+    </d:response>
+    </d:multistatus>'''
+    after, before = nsdav.parse_multistatus(xml, "/dav")
+    assert after.path == "/after" and before.path == "/before"
+    for e in (after, before):
+        assert e.size == 99
+        assert e.mtime is None
 
 
 def test_dir_size_is_zero_even_if_server_reports_one():
