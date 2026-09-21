@@ -1161,11 +1161,22 @@ def cmd_mkdir(dav, args) -> int:
 
 def cmd_rm(dav, args) -> int:
     target = normalize_remote_path(args.path)
-    if not (args.recursive and dav.stat(target).is_dir):
+    # 带不带 -r 都要先 stat 一次：判"目标是目录"只此一途。短路掉的话，目录
+    # 不带 -r 会落到下面的 delete()，由 T8 的守卫抛 NsdavError 兜住 —— 那是
+    # 退出码 1（一般错误），而 README 的退出码表写着 2 = 用法错误，脚本按 2
+    # 分类用法错时就会误判。这是 CLI 层判得出来的用法问题，不是服务端的事。
+    is_dir = dav.stat(target).is_dir
+    if is_dir and not args.recursive:
+        # --dry-run 也走这条：那种输入下打印"将删除"是误导 —— 真跑必被拒，
+        # 而 dry-run 的承诺是"打印真跑会发生的事"。
+        raise UsageError(
+            f"{target} 是目录，删除目录需要 -r（协议里没有只删空目录的操作）")
+    if not is_dir:
+        # 文件：-r 给不给都照删。
         if args.dry_run:
             print(f"将删除 {target}")
             return EXIT_OK
-        dav.delete(target)              # 目录且非递归时 T8 的守卫会拒绝
+        dav.delete(target)
         return EXIT_OK
 
     # 递归删整棵树就是**一个** DELETE：RFC 4918 §9.6.1 规定对集合缺省

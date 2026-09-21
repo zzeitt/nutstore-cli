@@ -174,7 +174,9 @@ nsdav quota                   查配额（RFC 4331，失败则明确报不支持
 6. **下载**：文件小于一个块（默认 16 MiB）时**一次 GET 拉完**，不分块——
    分块是为大文件省内存，小文件分块只会白白多花几次往返。
    大于一块时按 16 MiB 切 Range 块，写 `<目标>.part`，
-   每块按 `Content-Range` 校验字节数，全部到齐后 `os.replace` 原子改名。
+   每块按 64 KiB 本地计数推进 offset（`got == 0` 判"下载中断"），**不信任
+   服务端回的 `Content-Range` 头**；全部读完后再拿 `os.path.getsize(.part)`
+   与服务端给的总长比对，一致才 `os.replace` 原子改名。
    已有 `.part` 且服务端支持 Range 时**从断点继续**（用 `.part` 的当前大小作为
    起始 offset）；若 `.part` 比远端目标还大，说明本地残留是旧的，删掉重下。
 7. **上传**：从磁盘流式读，设置 `Content-Length`，超时给足（默认 120s，

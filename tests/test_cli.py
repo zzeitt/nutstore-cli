@@ -1,8 +1,9 @@
 """命令行层：argparse、cmd_* 分发、人类可读 / JSON 双输出。
 
-中间那一段是计划里 T12 的测试围栏，逐字节照抄。文末"围栏之外"一节是本
-任务在围栏之外补的三样东西：HOME 隔离 fixture，以及 P5 要求的 tree、quota
-两条用例（围栏只给了行为表，没有它们的用例代码）。
+中间那一段是计划里 T12 的测试围栏。文末"围栏之外"一节是围栏之后陆续补的
+夹具与用例：HOME 隔离 fixture，P5 要求的 tree / quota 用例（围栏只给了行为
+表，没有用例代码），修复轮 1 的 F1/F2，以及 `rm` 目录不带 `-r` 按用法错
+（2）退出这条。
 """
 import json
 import pytest
@@ -269,4 +270,25 @@ def test_quota_json_ignores_foreign_namespace_lookalikes(live_dav, capsys):
     code, out, _ = run(capsys, "--json", "quota")
     assert code == 0
     assert json.loads(out) == {"available": 222, "used": 444}
+
+
+def test_rm_dir_without_recursive_is_a_usage_error(live_dav, capsys):
+    """目录不带 `-r`：CLI 层就当用法错（2）拦下，而不是 DELETE 失败后再报。
+
+    只断退出码是没有区分力的：旧实现由库里的守卫抛 NsdavError，退出码 1，
+    而一个"先发 DELETE、再返回 2"的实现同样是 2。所以还钉住 DELETE 一次都
+    没发出去、目录与里面的文件都还在。`--dry-run` 也走同一条路 —— 旧实现
+    在那种输入下会打印"将删除"并以 0 退出，承诺了一件真跑时必然做不到的事。
+    """
+    code, _, err = run(capsys, "rm", "/d")
+    assert code == nsdav.EXIT_USAGE
+    assert "-r" in err
+
+    code, out, _ = run(capsys, "--dry-run", "rm", "/d")
+    assert code == nsdav.EXIT_USAGE
+    assert "将删除" not in out
+
+    assert not [m for m, _ in live_dav.requests if m == "DELETE"]
+    assert "/d" in live_dav.dirs
+    assert "/d/one.txt" in live_dav.store
 
