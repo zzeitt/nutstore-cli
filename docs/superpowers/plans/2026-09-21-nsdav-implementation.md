@@ -2477,10 +2477,13 @@ git commit -m "feat(webdav): 操作层，含分页跟随与自动建父目录"
 - 写 `<目标>.part`，全部到齐后 `os.replace` 原子改名 —— 中途失败不会留下半个正式文件。
 - 已有 `.part` 时从断点续；`.part` 比远端大则说明是旧残留，删掉重下。
 - 服务端对 Range 请求返回 `200`（而非 `206`）时，说明不支持 Range，必须从头来。
+- 回退分支同样**按块读**（64 KiB）—— 内存界在读取块大小，不在 `chunk` 的
+  请求粒度：对回退分支整份 `read()` 会一次把整个文件读进内存，把这条
+  "分块只为大文件省内存"的理由一次性作废。
 
 **关于 import（承 P6）：** 本节的代码块从分节注释开始，不含 import。按 P6，本节
 实现者自己补 `import os`（`nsdav.py` 顶部，`import http.client` 之后）—— 漏了它，
-`download` 里四处 `os.path.*`/`os.replace` 全是 `NameError`（实测：整份测试 7 条全红）。
+`download` 里四处 `os.path.*`/`os.replace` 全是 `NameError`（实测：整份测试 10 条全红）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -2501,9 +2504,8 @@ Range"那条分支 —— 不然那条分支的用例是空转的（mock 永远�
 
 `tests/test_transfer.py`：
 
-`tests/test_transfer.py`：
-
 ```python
+import contextlib
 import os
 import pytest
 
@@ -2660,6 +2662,104 @@ def test_no_part_file_left_on_success(dav, tmp_path):
     dest = tmp_path / "x.bin"
     nsdav.download(d, "/x.bin", str(dest), transport=t)
     assert sorted(p.name for p in tmp_path.iterdir()) == ["x.bin"]
+
+
+class _ReadSpy:
+    """记下每次 read 索要的字节数。-1 就是"不带参数的整份读"。"""
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.sizes = []
+
+    def read(self, n=-1):
+        self.sizes.append(n)
+        return self.raw.read(n)
+
+
+def _spy_stream(t):
+    """把 t.stream 包一层，换掉响应体好记录 read 索要的大小。
+
+    t.stream 是 contextmanager，spy 也得是；真身仍走 with，退出时由它把
+    连接读干净，所以记到的都只是实现自己发起的 read。
+    """
+    spies = []
+    real = t.stream
+
+    @contextlib.contextmanager
+    def spy(method, target, **kw):
+        with real(method, target, **kw) as resp:
+            body = _ReadSpy(resp.body)
+            spies.append(body)
+            yield resp._replace(body=body)
+
+    t.stream = spy
+    return spies
+
+
+def test_ignored_range_fallback_still_reads_in_chunks(dav, tmp_path):
+    """服务端忽略 Range 时，回退分支也必须按块读。
+
+    这一段只在服务端不支持 Range 时才会走到，mock 默认支持，所以此前没人
+    看得见 `f.write(resp.body.read())`：整个文件一次进内存，把分块省内存的
+    初衷作废（iSH 上内存比时间金贵）。断言的是**形状**——任何一次 read 都
+    必须带正数长度，也就是"整个响应体从不被一次性物化"。只断言内容的话，
+    两种写法都绿。
+    """
+    s, base = dav
+    d, t = _dav(s, base)
+    payload = bytes(range(256)) * 32768          # 8 MiB
+    s.add_file("/huge.bin", payload)
+    s.ignore_range = True
+    dest = tmp_path / "huge.bin"
+    spies = _spy_stream(t)
+    seen = []
+
+    nsdav.download(d, "/huge.bin", str(dest), transport=t,
+                   progress=lambda done, total: seen.append((done, total)))
+
+    assert dest.read_bytes() == payload
+    sizes = [n for sp in spies for n in sp.sizes]
+    assert sizes, "一次 read 都没有？"
+    assert all(isinstance(n, int) and n > 0 for n in sizes), sizes
+    # 回退路径只有这条用例走得到，进度也就只能在这里钉：一路报到 total。
+    assert seen[-1] == (len(payload), len(payload)), seen[-1]
+
+
+def test_progress_reports_from_the_resume_point(dav, tmp_path):
+    """progress 回调从断点接着报，一路报到 total。"""
+    s, base = dav
+    d, t = _dav(s, base)
+    payload = bytes(range(256)) * 200            # 51200
+    s.add_file("/big.bin", payload)
+    dest = tmp_path / "big.bin"
+    with open(str(dest) + ".part", "wb") as f:   # 上次下到一半
+        f.write(payload[:20000])
+
+    seen = []
+    nsdav.download(d, "/big.bin", str(dest), chunk=8192, transport=t,
+                   progress=lambda done, total: seen.append((done, total)))
+
+    assert dest.read_bytes() == payload
+    assert seen[-1] == (51200, 51200), seen
+    assert seen[0][0] > 20000, seen              # 第一次报就已包含已有字节
+
+
+def test_progress_reports_when_part_is_already_complete(dav, tmp_path):
+    """`.part` 已经是一整份时也要报一次收尾，不能一声不吭地改名返回。"""
+    s, base = dav
+    d, t = _dav(s, base)
+    payload = bytes(range(256)) * 200            # 51200
+    s.add_file("/big.bin", payload)
+    dest = tmp_path / "big.bin"
+    with open(str(dest) + ".part", "wb") as f:
+        f.write(payload)
+
+    seen = []
+    nsdav.download(d, "/big.bin", str(dest), transport=t,
+                   progress=lambda done, total: seen.append((done, total)))
+
+    assert dest.read_bytes() == payload
+    assert seen == [(51200, 51200)], seen
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -2704,6 +2804,7 @@ def download(dav, remote_path, local_path, *, chunk=DOWNLOAD_CHUNK,
             os.remove(part)              # 旧残留，重下
         elif have == total:
             os.replace(part, local_path)
+            report(total)                # 已经是一整份，也得把进度收尾
             return local_path, total
         else:
             offset = have
@@ -2718,12 +2819,22 @@ def download(dav, remote_path, local_path, *, chunk=DOWNLOAD_CHUNK,
             with t.stream("GET", target,
                           headers={"Range": f"bytes={offset}-{end}"}) as resp:
                 if resp.status == 200:
-                    # 服务端忽略 Range，从头返回：丢掉已有进度重来
+                    # 服务端忽略 Range，从头返回：丢掉已有进度重来。
+                    # 这里同样必须按块读 —— 上面那个分块只约束请求粒度
+                    # （chunk 默认 16 MiB），内存界是这里的 64 KiB。整份
+                    # read() 会一次性把整个文件读进内存，把"分块只为大文件
+                    # 省内存"这个理由作废，而 iSH 上内存比时间金贵。
                     if offset:
                         f.seek(0)
                         f.truncate(0)
                         offset = 0
-                    f.write(resp.body.read())
+                    while True:
+                        buf = resp.body.read(65536)
+                        if not buf:
+                            break
+                        f.write(buf)
+                        offset += len(buf)
+                        report(offset)
                     break
                 if resp.status == 206:
                     got = 0
