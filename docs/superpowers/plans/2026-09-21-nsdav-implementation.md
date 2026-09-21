@@ -3412,7 +3412,8 @@ git commit -m "test: 对真实坚果云的实测用例"
 ### Task 14: 文档与许可证
 
 **Files:**
-- Create: `README.md`, `AGENTS.md`, `LICENSE`, `.gitignore`
+- Create: `README.md`, `AGENTS.md`, `LICENSE`
+- Modify: `.gitignore` —— **已存在且已被跟踪，只补不删**（见 Step 4）
 
 - [ ] **Step 1: README.md**
 
@@ -3432,21 +3433,43 @@ Commit message format（3Cs + Conventional Commits，scope 用 `core`/`webdav`/
 
 - [ ] **Step 3: LICENSE**
 
-AGPL-3.0 全文。
+AGPL-3.0 **全文，逐字**。**不要凭记忆默写**——三万四千字节的法律文本靠记忆写
+必然走样，而走样的许可证比没有许可证更糟（它声称的条款和实际条款不一致）。
 
-- [ ] **Step 4: .gitignore**
+用 WebFetch 取 `https://www.gnu.org/licenses/agpl-3.0.txt` 原样落盘，然后核对
+三件事：文件里同时出现 `GNU AFFERO GENERAL PUBLIC LICENSE` 与
+`Version 3, 19 November 2007`，且字节数大于 30000。三条都过了才算这一步做完；
+任何一条不过就说明拿到的是摘要而不是全文。
+
+- [ ] **Step 4: .gitignore（已存在，只补不删）**
+
+`.gitignore` 在 `cc67d54`（`chore: 添加 .gitignore 并移除误提交的 __pycache__`）
+就已经存在，而且**已被 git 跟踪**（`git ls-files` 里有它）。它的实际内容比这里
+原本列的更全：
 
 ```
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
 *.part
 ```
 
+所以这一步**既不是新建也不是覆盖**。覆盖会丢掉 `*.py[cod]`，从此 `.pyo` /
+`.pyd` 都能被提交进来——这是净损失。照上面四条确认一遍，都在就**不要动这个
+文件**。
+
+`.superpowers/` 不需要往这里加。SDD 技能在 `.superpowers/sdd/` 下自己写了一个
+内容为 `*` 的 `.gitignore`，scratch 目录由它自我忽略：`git check-ignore -v
+.superpowers/sdd/.../progress.md` 命中的就是那一行（而不是仓库的 `.gitignore`）。
+加进去不算错，但属于冗余，不是这一步的交付物。
+
 - [ ] **Step 5: 提交**
 
+`.gitignore` 不在 `git add` 里：它这一步不该有改动（Step 4）。提交前用
+`git status --porcelain` 确认它没出现在列表里。
+
 ```bash
-git add README.md AGENTS.md LICENSE .gitignore
+git add README.md AGENTS.md LICENSE
 git commit -m "docs: 添加 README、AGENTS.md 与 AGPL-3.0 许可证"
 ```
 
