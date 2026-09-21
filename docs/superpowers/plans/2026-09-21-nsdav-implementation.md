@@ -2123,12 +2123,18 @@ def test_listdir_follows_pagination():
 def test_pagination_does_not_double_encode_special_names():
     """目录名含空格时分页必须仍然正确 —— 这是双编码 bug 的回归测试。
 
-    只断言"拿到 7 个名字"是个**代理**：它确实会被双编码打破（mock 存的路径
-    是未编码的，双编码的 marker 解码后变成 `%20` 字面量，按 `%`(0x25) >
-    ` `(0x20) 排序，所有条目都落在 marker 之前而被丢掉，于是只剩 3 个），但
-    失败信息只说"少了几条"，不说为什么。所以这里直接把**机制**钉住：
-    第二次 PROPFIND 的 target 必须单编码。`%20` 与 `%2520` 那两行就是
-    红线本身，双编码一出现就以自己的名字失败。
+    只断言"拿到 7 个名字"是个**代理**，所以这里把 wire 形式整个钉死：三次
+    PROPFIND 的 target 必须逐字等于服务器给的形式——第一页由 `self.target()`
+    编出来，后两页的 marker 原样透传 Link 里的 `%2Fmy%20dir%2Ff1.txt` 与
+    `%2Fmy%20dir%2Ff4.txt`（page_size=3、7 个文件，正好三页）。
+
+    **marker 被破坏时，先红的是异常，不是这条断言**（实测，别指望断言先红）：
+    整条 Link 再过一次 `enc_path()` 会被 mock 的 `_rel()` 断言拦下并断连
+    （客户端看到 NetworkError）；只把 marker 再编一次会让 mock 反复重发第一页，
+    客户端一直翻到 10000 层保护（NsdavError，实测约 13 秒）；把 marker 解编码
+    则 URL 根本发不出去（http.client 的 InvalidURL）。所以这条断言管的是另一
+    层：**分页能走完、但 wire 形式被改动**的那些情形——例如小写百分号转义
+    （`%2f`），它照样翻完 7 页、旧的两条子串断言全绿，只有这里能红（实测）。
     """
     s = MockDAV(page_size=3); base = s.start()
     try:
@@ -2140,9 +2146,11 @@ def test_pagination_does_not_double_encode_special_names():
         assert len(names) == 7
 
         propfinds = [t for m, t in s.requests if m == "PROPFIND"]
-        assert len(propfinds) >= 2, "page_size=3 / 7 个文件，必须真的翻页"
-        assert "%20" in propfinds[1], "第二页的 marker 丢了单编码"
-        assert "%2520" not in propfinds[1], "marker 被二次编码了"
+        assert propfinds == [
+            "/dav/my%20dir",
+            "/dav/my%20dir?mk=%2Fmy%20dir%2Ff1.txt",
+            "/dav/my%20dir?mk=%2Fmy%20dir%2Ff4.txt",
+        ], f"分页 target 不是服务器给的形式: {propfinds}"
     finally:
         s.stop()
 
