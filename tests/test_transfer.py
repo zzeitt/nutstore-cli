@@ -1,6 +1,7 @@
 import contextlib
 import os
 import pytest
+import random
 
 import nsdav
 from mock_dav import MockDAV
@@ -400,11 +401,14 @@ def test_strong_verify_streams_when_server_ignores_range(dav, tmp_path):
     这条路此前一个用例都走不到（mock 默认支持 Range），而它明确承认 200 是
     合法响应。整份 `read()` 会把远端文件全读进内存 —— 与 T9 回退分支同一个
     坑。断言两层：任何一次 read 都带正数长度（形状），以及"内容对得上时不
-    误报"（滚动窗口必须留**末尾**；只留开头会在这里假报警）。
+    误报"（滚动窗口必须留**末尾**；只留开头会在这里假报警）。载荷用非周期的
+    随机字节：周期载荷的周期若整除 VERIFY_TAIL_BYTES（64），开头窗口会落在
+    与末尾一模一样的字节上，这条用例就悄悄不再抓"只留开头"的 bug 了；非周期
+    载荷不管 VERIFY_TAIL_BYTES 改成多少都保持这一口咬合。
     """
     s, base = dav
     d, t = _dav(s, base)
-    payload = bytes(range(256)) * 32768          # 8 MiB
+    payload = random.Random(20260921).randbytes(8 * 1024 * 1024)   # 8 MiB，非周期
     src = tmp_path / "big.bin"
     src.write_bytes(payload)
     s.add_file("/big.bin", payload)              # 远端内容与本地一致
@@ -417,3 +421,29 @@ def test_strong_verify_streams_when_server_ignores_range(dav, tmp_path):
     sizes = [x for sp in spies for x in sp.sizes]
     assert sizes, "一次 read 都没有？"
     assert all(isinstance(x, int) and 0 < x <= 65536 for x in sizes), sizes
+
+
+def test_strong_verify_over_range_reads_only_the_tail(dav, tmp_path):
+    """206 成功路径：Range 只要尾巴，回读的 body 就只有 tail 字节。
+
+    这条路径此前没有任何用例 —— 唯一走 206 的那条只期望报错，所以"Range 发错成
+    整份"这类变异可以活着：内容比对用滚动窗口仍然对得上，只是把整个远端文件
+    又拉了一遍（真机上默认走的就是 206）。这里用一个远大于一个块的载荷，让
+    "只回了尾巴"和"回了整份"在读次数上分得开。
+    """
+    s, base = dav
+    d, t = _dav(s, base)
+    payload = random.Random(20260921).randbytes(256 * 1024)   # 256 KiB，非周期
+    src = tmp_path / "big.bin"
+    src.write_bytes(payload)
+    s.add_file("/big.bin", payload)              # 远端内容与本地一致
+    spies = _spy_stream(t)
+
+    n = nsdav.upload(d, str(src), "/big.bin", verify="strong")
+
+    assert n == len(payload)
+    # 206 只回 64 字节的尾巴：一次 read 拿到它，再一次拿到空串结束 —— 两次。
+    # 若 Range 要的是整份，256 KiB 至少要 4 次满块读才能读完，必红。
+    sizes = [x for sp in spies for x in sp.sizes]
+    assert sizes, "一次 read 都没有？"
+    assert len(sizes) <= 2, sizes
