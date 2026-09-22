@@ -4502,7 +4502,8 @@ git commit -m "feat(cli): 命令分发与人类可读/JSON 双输出"
     NSDAV_WEBDAV_USER=... NSDAV_WEBDAV_PASSWORD=... \
     python -m pytest tests/test_live.py -v -m live
 
-只在 /notes/nsdav-test/ 下操作，测试结束自动清理。
+默认只在 /notes/nsdav-test/ 下操作（用 NSDAV_TEST_DIR 可改），测试结束自动清理。
+Git Bash 下给 NSDAV_TEST_DIR 传绝对路径要加 MSYS_NO_PATHCONV=1，否则会被改写成 C:/Program Files/Git/... 那一串。
 """
 import os
 import sys
@@ -4511,7 +4512,7 @@ import pytest
 
 import nsdav
 
-TEST_DIR = "/notes/nsdav-test"
+TEST_DIR = os.environ.get("NSDAV_TEST_DIR", "/notes/nsdav-test")
 
 pytestmark = [
     pytest.mark.live,
@@ -4528,7 +4529,7 @@ def dav():
         "url": None, "user": None, "password": None,
         "min_gap": None, "max_retries": None, "timeout": None})(), config={})
     assert cfg.base_path == "/dav", (
-        f"实测只许在 /dav/notes 下；当前 base_path={cfg.base_path}，"
+        f"实测只许在 /dav 挂载下（测试目录 {TEST_DIR}）；当前 base_path={cfg.base_path}，"
         f"检查 NSDAV_WEBDAV_URL 与配置文件")
     t = nsdav.Transport(cfg.host, port=cfg.port, use_tls=cfg.use_tls,
                         user=cfg.user, password=cfg.password,
