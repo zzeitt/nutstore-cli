@@ -318,6 +318,57 @@ def test_stat_on_a_directory_has_no_double_slash(live_dav, capsys):
     assert out.strip() == "/d/one.txt  1 B", out
 
 
+def test_dry_run_put_refuses_a_missing_local_file(live_dav, capsys, tmp_path):
+    """`--dry-run put` 不能承诺一件真跑做不到的事。
+
+    `cmd_rm` 特意先 stat 就是为了这条契约（真跑必被拒的输入，dry-run 也不许
+    打印"将删除"）。put 之前没跟上：本地文件不存在时 dry-run 打印"将上传"并
+    以 0 退出，而真跑是"错误: 本地文件不存在"、退出 2。
+
+    断言四层：退出码与真跑一致（2）、没有"将上传"、一个 PUT 都没发出去、
+    真跑的退出码确实是 2（把两边钉在一起，不是各说各话）。
+    """
+    missing = str(tmp_path / "nope.txt")
+
+    code, out, err = run(capsys, "--dry-run", "put", missing, "/d/x.txt")
+    assert code == nsdav.EXIT_USAGE
+    assert "将上传" not in out
+    assert "不存在" in err
+    assert not [m for m, _ in live_dav.requests if m == "PUT"]
+
+    assert run(capsys, "put", missing, "/d/x.txt")[0] == nsdav.EXIT_USAGE
+
+
+def test_dry_run_mv_and_cp_print_normalized_paths(live_dav, capsys):
+    """dry-run 打印的必须是**规范化之后**的两端。
+
+    原样回显 `../d/two.txt` 会让人以为能跑出挂载点（真跑会把它折回根内）。
+    断言"打印了什么"和"真跑做了什么"是同一件事。
+    """
+    code, out, _ = run(capsys, "--dry-run", "mv", "./d/one.txt", "../d/two.txt")
+    assert code == 0
+    assert out.strip() == "将移动 /d/one.txt → /d/two.txt", out
+
+    code, out, _ = run(capsys, "--dry-run", "cp", "d/one.txt", "/d//sub/")
+    assert code == 0
+    assert out.strip() == "将复制 /d/one.txt → /d/sub", out
+
+    assert not [m for m, _ in live_dav.requests if m in ("MOVE", "COPY")]
+    assert "/d/one.txt" in live_dav.store
+
+
+def test_dry_run_get_on_a_directory_is_refused(live_dav, capsys):
+    """`--dry-run get` 对目录同样要拒（真跑会被 download 拒掉）。"""
+    code, out, err = run(capsys, "--dry-run", "get", "/d")
+    assert code == nsdav.EXIT_ERROR
+    assert "将下载" not in out
+    assert "是目录" in err
+    assert not [m for m, _ in live_dav.requests if m == "GET"]
+
+    # 真跑同一个输入，退出码要一致
+    assert run(capsys, "get", "/d", "/tmp/whatever")[0] == nsdav.EXIT_ERROR
+
+
 def test_unknown_size_renders_as_a_question_mark(live_dav, capsys, monkeypatch):
     """服务端不报大小时，人类可读的大小列是 `?`，不是 `0 B`。
 

@@ -1175,6 +1175,10 @@ def cmd_get(dav, args) -> int:
     remote = normalize_remote_path(args.remote)
     local = args.local or os.path.basename(remote.rstrip("/")) or "download"
     if args.dry_run:
+        # dry-run 的承诺是"打印真跑会发生的事"（同 cmd_rm）。目标是目录时真跑
+        # 会被 download() 拒掉，所以这里也得先看清楚再开口。
+        if dav.stat(remote).is_dir:
+            raise NsdavError(f"{remote} 是目录，不能下载")
         print(f"将下载 {remote} → {local}")
         return EXIT_OK
     path, n = download(dav, remote, local, transport=dav.t,
@@ -1188,6 +1192,10 @@ def cmd_put(dav, args) -> int:
     remote = normalize_remote_path(
         args.remote or "/" + os.path.basename(args.local))
     if args.dry_run:
+        # 同样的道理：真跑会在 upload() 里以"本地文件不存在"（用法错 2）退出，
+        # 这里打印"将上传"就是承诺一件做不到的事。
+        if not os.path.isfile(args.local):
+            raise UsageError(f"本地文件不存在: {args.local}")
         print(f"将上传 {args.local} → {remote}")
         return EXIT_OK
     n = upload(dav, args.local, remote, verify=args.verify)
@@ -1248,7 +1256,10 @@ def cmd_rm(dav, args) -> int:
 
 def cmd_mv(dav, args) -> int:
     if args.dry_run:
-        print(f"将移动 {args.src} → {args.dst}")
+        # 打印**规范化之后**的两端：原样回显 `../d/x` 会让人以为能跑出挂载点，
+        # 而真跑时 normalize_remote_path 会把它折回根内。
+        print(f"将移动 {normalize_remote_path(args.src)} → "
+              f"{normalize_remote_path(args.dst)}")
         return EXIT_OK
     dav.move(args.src, args.dst)
     return EXIT_OK
@@ -1256,7 +1267,8 @@ def cmd_mv(dav, args) -> int:
 
 def cmd_cp(dav, args) -> int:
     if args.dry_run:
-        print(f"将复制 {args.src} → {args.dst}")
+        print(f"将复制 {normalize_remote_path(args.src)} → "
+              f"{normalize_remote_path(args.dst)}")
         return EXIT_OK
     dav.copy(args.src, args.dst)
     return EXIT_OK
