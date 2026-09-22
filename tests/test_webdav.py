@@ -249,3 +249,38 @@ def test_walk_terminates_when_a_directory_lists_itself(dav):
     assert len(list(d.walk("/loop"))) == 1
 
 
+# ── 复审补的用例：409 补建要换连接、207 零条目 ──
+
+def test_put_409_retry_drops_the_connection(tmp_path, dav):
+    """撞 409 后补建父目录**必须换一条连接**（复审发现回归，曾漏掉这行）。
+
+    409 与 503 是同一个形状：父集合不存在时服务器读完请求头就拒绝，PUT 的
+    请求体还留在 socket 里。不换连接就发 MKCOL，请求行会被那堆残留字节接上，
+    服务器看到的方法名是垃圾。已用真实 `http.server` 独立复现：服务器只看到
+    `PUT`，随后的 MKCOL 被判成未知方法，客户端拿到 HTTP 501 —— 而 README
+    承诺的"put 不用先 mkdir"本该在这条路上兑现。
+
+    只断言"最终文件写进去了"抓不到它：mock 会把请求体读干净，怎么复用都成功。
+    所以数连接条数（照抄 test_status_retry_drops_the_connection 的手法）。
+    """
+    s, base = dav
+    d = _dav(s, base)
+    t = d.t
+    made = []
+    real_new = t._new_conn
+
+    def counting():
+        c = real_new()
+        made.append(c)
+        return c
+
+    t._new_conn = counting
+    p = tmp_path / "f.bin"
+    p.write_bytes(b"abcdef")
+    d.put("/deep/dir/f.bin", nsdav.StreamBody(lambda: open(p, "rb"), 6))
+
+    assert s.store["/deep/dir/f.bin"] == b"abcdef"
+    assert [m for m, _ in s.requests] == ["PUT", "MKCOL", "MKCOL", "PUT"]
+    assert len(made) == 2, f"409 之后复用了旧连接（只建了 {len(made)} 条）"
+
+

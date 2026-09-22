@@ -424,6 +424,14 @@ class Transport:
     def close(self) -> None:
         self._drop_conn()
 
+    def drop_connection(self) -> None:
+        """丢掉当前连接，下一次请求会新建一条。
+
+        给"状态可疑"的连接用：服务器可能读完请求头就拒绝了、请求体没读净，
+        剩下的字节留在 socket 里，下一个请求行会被它们接上。
+        """
+        self._drop_conn()
+
     def _log(self, msg: str) -> None:
         if self.verbose:
             print(f"  · {msg}", file=sys.stderr)
@@ -661,6 +669,13 @@ class WebDAV:
         target = self.target(rel_path)
         resp = self.t.request("PUT", target, body=data)
         if resp.status == 409:
+            # 409 与 503 是同一个形状：父集合不存在时，服务器读完请求头就
+            # 拒绝，PUT 的请求体还留在 socket 里。不换连接就发 MKCOL，请求行
+            # 会被那堆残留字节接上，服务器看到的方法名是垃圾。已用真实
+            # http.server 复现：只看到 PUT，随后的 MKCOL 被污染成未知方法，
+            # 客户端拿到 HTTP 501 —— README 承诺的"put 不用先 mkdir"本该在
+            # 这条路上兑现，却以一个完全误导的报错收场。
+            self.t.drop_connection()
             parent = normalize_remote_path(rel_path).rsplit("/", 1)[0]
             self.mkdirs(parent)
             resp = self.t.request("PUT", target, body=data)
