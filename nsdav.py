@@ -85,11 +85,16 @@ class NetworkError(NsdavError):
 
 @dataclass
 class Entry:
-    """远端一个文件或目录。path 是相对 WebDAV 根的路径，已解码。"""
+    """远端一个文件或目录。path 是相对 WebDAV 根的路径，已解码。
+
+    `size` 为 None 表示**服务端没报大小**（PROPFIND 里缺 getcontentlength，
+    或值不是纯数字），这与"大小是 0"是两件事。目录的 size 一律是 0 —— 集合
+    的大小没有意义，也从没有哪个调用方读过它。
+    """
     path: str
     name: str
     is_dir: bool
-    size: int
+    size: int | None
     mtime: float | None
 
 
@@ -251,8 +256,11 @@ def parse_multistatus(xml_bytes: bytes, base_path: str) -> list[Entry]:
         rtype = props.get(f"{DAV}resourcetype")
         is_dir = rtype is not None and rtype.find(f"{DAV}collection") is not None
 
+        # 取不到就是 None（"不知道"），不是 0（"空"）。两者混成一个值会让
+        # download() 把"问不到大小"当成"远端是空文件"：它会把本地文件截成
+        # 0 字节并以成功退出。宁可让调用方看见"不知道"。
+        size: int | None = None
         size_el = props.get(f"{DAV}getcontentlength")
-        size = 0
         if size_el is not None and size_el.text and size_el.text.strip().isdigit():
             size = int(size_el.text.strip())
 
@@ -719,6 +727,14 @@ def download(dav, remote_path, local_path, *, chunk=DOWNLOAD_CHUNK,
     if entry.is_dir:
         raise NsdavError(f"{remote_path} 是目录，不能下载")
     total = entry.size
+    if total is None:
+        # 大小未知时**绝不能**当成 0 往下走：total == 0 那条路会把本地文件
+        # 换成一个空文件并返回成功。问不到大小就是这个下载做不了的理由，
+        # 说清楚比猜一个数好。
+        raise NsdavError(
+            f"服务端没有返回 {remote_path} 的大小（PROPFIND 缺 "
+            f"getcontentlength），无法安全下载：先告诉远端文件多大，"
+            f"或者换个能报大小的服务端")
     part = local_path + ".part"
     t = transport or dav.t
 
@@ -819,6 +835,12 @@ def upload(dav, local_path, remote_path, *, verify="size",
     dav.put(remote_path, StreamBody(factory, size))
 
     entry = dav.stat(remote_path)
+    if entry.size is None:
+        # 不能把这个当成"大小不符"报出去 —— 那句话里会印出"远端 None"，
+        # 而真正发生的事是校验做不了。
+        raise NsdavError(
+            f"服务端没有返回 {remote_path} 的大小（PROPFIND 缺 "
+            f"getcontentlength），传后校验做不了")
     if entry.size != size:
         raise NsdavError(
             f"上传后大小不符：{remote_path} 期望 {size}，远端 {entry.size}")
@@ -999,6 +1021,15 @@ def _entry_dict(e: Entry) -> dict[str, Any]:
             "size": e.size, "mtime": e.mtime}
 
 
+def _size_text(e: Entry) -> str:
+    """人类可读输出里的大小列。服务端没报大小就写 `?`。
+
+    不能退化写成 `0 B`：`0 B` 是一个确定的事实，而"不知道"不是 —— 这跟
+    `Entry.size` 用 None 而不是 0 表示未知是同一条理由。
+    """
+    return "?" if e.size is None else format_size(e.size)
+
+
 def _print_entries(entries, as_json: bool) -> None:
     if as_json:
         print(json.dumps([_entry_dict(e) for e in entries],
@@ -1008,7 +1039,7 @@ def _print_entries(entries, as_json: bool) -> None:
         if e.is_dir:
             print(f"  {'<dir>':>10}  {e.name}/")
         else:
-            print(f"  {format_size(e.size):>10}  {e.name}")
+            print(f"  {_size_text(e):>10}  {e.name}")
 
 
 def _make_dav(cfg: Config) -> WebDAV:
@@ -1090,7 +1121,7 @@ def _print_entry(e: Entry, as_json: bool) -> None:
     elif e.is_dir:
         print(f"{e.path}/")
     else:
-        print(f"{e.path}  {format_size(e.size)}")
+        print(f"{e.path}  {_size_text(e)}")
 
 
 def cmd_ls(dav, args) -> int:

@@ -247,3 +247,5 @@ def test_walk_terminates_when_a_directory_lists_itself(dav):
     d.listdir = loopy
 
     assert len(list(d.walk("/loop"))) == 1
+
+

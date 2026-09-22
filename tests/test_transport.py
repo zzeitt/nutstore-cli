@@ -200,3 +200,5 @@ def test_stream_body_retry_reopens_file(tmp_path, dav):
     r = t.request("PUT", "/dav/f.bin", body=body)
     assert r.status == 201
     assert s.store["/f.bin"] == b"abcdef"   # 重试后内容完整，不是空的
+
+

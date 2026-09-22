@@ -292,3 +292,40 @@ def test_rm_dir_without_recursive_is_a_usage_error(live_dav, capsys):
     assert "/d" in live_dav.dirs
     assert "/d/one.txt" in live_dav.store
 
+
+
+def test_unknown_size_renders_as_a_question_mark(live_dav, capsys, monkeypatch):
+    """服务端不报大小时，人类可读的大小列是 `?`，不是 `0 B`。
+
+    这与 `Entry.size` 用 None 而不是 0 是同一条理由的另一半：解析层分开了
+    "不知道"和"空"，输出层**必须**跟着分开，否则 `0 B` 又把两者合了回去，
+    而且这次是在用户眼前合的。
+
+    用 dataclasses.replace 改真跑出来的条目，让 ls/stat 的其余管路（分页、
+    排序、JSON 那条）都还是真的。
+    """
+    import dataclasses
+    real = nsdav.WebDAV.propfind
+
+    def no_size(self, path, depth="1"):
+        return [dataclasses.replace(e, size=None) if not e.is_dir else e
+                for e in real(self, path, depth)]
+
+    monkeypatch.setattr(nsdav.WebDAV, "propfind", no_size)
+
+    code, out, _ = run(capsys, "ls", "/d")
+    assert code == 0
+    assert "?" in out and "0 B" not in out, out
+
+    code, out, _ = run(capsys, "stat", "/d/one.txt")
+    assert code == 0
+    assert out.strip().endswith("?"), out
+
+    # 目录那行仍然是 <dir>，没被这条改动带歪（列 /d 的子项里没有子目录，
+    # 要列根才会出现 <dir> 那一行）
+    assert "<dir>" in run(capsys, "ls", "/")[1]
+
+    # JSON 那条路给出的是 null（"不知道"），不是 0
+    code, out, _ = run(capsys, "--json", "stat", "/d/one.txt")
+    assert code == 0
+    assert json.loads(out)["size"] is None

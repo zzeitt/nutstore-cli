@@ -447,3 +447,74 @@ def test_strong_verify_over_range_reads_only_the_tail(dav, tmp_path):
     sizes = [x for sp in spies for x in sp.sizes]
     assert sizes, "一次 read 都没有？"
     assert len(sizes) <= 2, sizes
+
+
+# ── 复审补的用例：大小未知 / 三道守卫 / upload 的错误与回调 ──
+
+class _StubDav:
+    """只回答 stat/target 的最小 WebDAV 替身，用来把 download 逼到指定分支。
+
+    这些分支（大小未知、目标是目录）都在**第一个请求之前**就决定了去向，
+    所以不需要真服务器 —— 用真服务器反而没法造出"服务端不报大小"。
+    """
+
+    def __init__(self, entry, t=None):
+        self._entry = entry
+        self.t = t
+
+    def stat(self, path):
+        return self._entry
+
+    def target(self, path):
+        return "/dav" + nsdav.normalize_remote_path(path)
+
+
+def test_download_refuses_when_the_remote_size_is_unknown(tmp_path):
+    """大小未知时**拒绝下载**，绝不能把本地文件截成 0 字节还报成功。
+
+    已复现过的形状：解析层把"缺 getcontentlength"落成 size=0，download 便认
+    为"远端是空文件"→ 写一个空 .part、`os.replace` 覆盖本地文件、返回
+    (path, 0)、退出码 0。本地那份数据就这么没了，没有任何信号。
+
+    本用例钉两层：抛 NsdavError，以及**本地文件一个字节都没动**。只断"抛错"
+    的话，一个"先截断再报错"的实现照样绿。
+    """
+    dest = tmp_path / "notes.md"
+    dest.write_bytes(b"IMPORTANT" * 100)
+    stub = _StubDav(nsdav.Entry(path="/f.bin", name="f.bin", is_dir=False,
+                                size=None, mtime=None))
+
+    with pytest.raises(nsdav.NsdavError, match="没有返回"):
+        nsdav.download(stub, "/f.bin", str(dest))
+
+    assert dest.read_bytes() == b"IMPORTANT" * 100
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["notes.md"]
+
+
+def test_upload_refuses_when_the_remote_size_is_unknown(dav, tmp_path):
+    """传完读回大小、而服务端不报大小时，校验必须**明确说做不了**。
+
+    不能退化成"大小不符：期望 5，远端 None" —— 那句话把"校验做不了"说成了
+    "校验没过"，还印一个 None 出来。两者的处置完全不同：前者要找服务端，
+    后者要查内容。
+
+    文件确实已经传上去了（`dav.put` 是真的打到了 mock），所以这条同时钉住
+    "报错之前该做的请求已经做了" —— 报错说的是校验这步，不是上传那步。
+    """
+    s, base = dav
+    d, t = _dav(s, base)
+    src = tmp_path / "up.bin"
+    src.write_bytes(b"hello")
+
+    real_stat = d.stat
+    d.stat = lambda p: nsdav.Entry(path="/up.bin", name="up.bin",
+                                   is_dir=False, size=None, mtime=None)
+
+    with pytest.raises(nsdav.NsdavError, match="校验做不了") as ei:
+        nsdav.upload(d, str(src), "/up.bin")
+    assert "None" not in str(ei.value), str(ei.value)
+    assert s.store["/up.bin"] == b"hello"
+
+    # 而大小报得出来时，这条路是通的（上面那条不是把成功路径一起拒了）
+    d.stat = real_stat
+    assert nsdav.upload(d, str(src), "/up2.bin") == 5
