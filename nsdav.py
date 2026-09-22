@@ -85,11 +85,16 @@ class NetworkError(NsdavError):
 
 @dataclass
 class Entry:
-    """远端一个文件或目录。path 是相对 WebDAV 根的路径，已解码。"""
+    """远端一个文件或目录。path 是相对 WebDAV 根的路径，已解码。
+
+    `size` 为 None 表示**服务端没报大小**（PROPFIND 里缺 getcontentlength，
+    或值不是纯数字），这与"大小是 0"是两件事。目录的 size 一律是 0 —— 集合
+    的大小没有意义，也从没有哪个调用方读过它。
+    """
     path: str
     name: str
     is_dir: bool
-    size: int
+    size: int | None
     mtime: float | None
 
 
@@ -251,8 +256,11 @@ def parse_multistatus(xml_bytes: bytes, base_path: str) -> list[Entry]:
         rtype = props.get(f"{DAV}resourcetype")
         is_dir = rtype is not None and rtype.find(f"{DAV}collection") is not None
 
+        # 取不到就是 None（"不知道"），不是 0（"空"）。两者混成一个值会让
+        # download() 把"问不到大小"当成"远端是空文件"：它会把本地文件截成
+        # 0 字节并以成功退出。宁可让调用方看见"不知道"。
+        size: int | None = None
         size_el = props.get(f"{DAV}getcontentlength")
-        size = 0
         if size_el is not None and size_el.text and size_el.text.strip().isdigit():
             size = int(size_el.text.strip())
 
@@ -414,6 +422,14 @@ class Transport:
             self._conn = None
 
     def close(self) -> None:
+        self._drop_conn()
+
+    def drop_connection(self) -> None:
+        """丢掉当前连接，下一次请求会新建一条。
+
+        给"状态可疑"的连接用：服务器可能读完请求头就拒绝了、请求体没读净，
+        剩下的字节留在 socket 里，下一个请求行会被它们接上。
+        """
         self._drop_conn()
 
     def _log(self, msg: str) -> None:
@@ -653,6 +669,13 @@ class WebDAV:
         target = self.target(rel_path)
         resp = self.t.request("PUT", target, body=data)
         if resp.status == 409:
+            # 409 与 503 是同一个形状：父集合不存在时，服务器读完请求头就
+            # 拒绝，PUT 的请求体还留在 socket 里。不换连接就发 MKCOL，请求行
+            # 会被那堆残留字节接上，服务器看到的方法名是垃圾。已用真实
+            # http.server 复现：只看到 PUT，随后的 MKCOL 被污染成未知方法，
+            # 客户端拿到 HTTP 501 —— README 承诺的"put 不用先 mkdir"本该在
+            # 这条路上兑现，却以一个完全误导的报错收场。
+            self.t.drop_connection()
             parent = normalize_remote_path(rel_path).rsplit("/", 1)[0]
             self.mkdirs(parent)
             resp = self.t.request("PUT", target, body=data)
@@ -719,6 +742,14 @@ def download(dav, remote_path, local_path, *, chunk=DOWNLOAD_CHUNK,
     if entry.is_dir:
         raise NsdavError(f"{remote_path} 是目录，不能下载")
     total = entry.size
+    if total is None:
+        # 大小未知时**绝不能**当成 0 往下走：total == 0 那条路会把本地文件
+        # 换成一个空文件并返回成功。问不到大小就是这个下载做不了的理由，
+        # 说清楚比猜一个数好。
+        raise NsdavError(
+            f"服务端没有返回 {remote_path} 的大小（PROPFIND 缺 "
+            f"getcontentlength），无法安全下载：先告诉远端文件多大，"
+            f"或者换个能报大小的服务端")
     part = local_path + ".part"
     t = transport or dav.t
 
@@ -819,6 +850,12 @@ def upload(dav, local_path, remote_path, *, verify="size",
     dav.put(remote_path, StreamBody(factory, size))
 
     entry = dav.stat(remote_path)
+    if entry.size is None:
+        # 不能把这个当成"大小不符"报出去 —— 那句话里会印出"远端 None"，
+        # 而真正发生的事是校验做不了。
+        raise NsdavError(
+            f"服务端没有返回 {remote_path} 的大小（PROPFIND 缺 "
+            f"getcontentlength），传后校验做不了")
     if entry.size != size:
         raise NsdavError(
             f"上传后大小不符：{remote_path} 期望 {size}，远端 {entry.size}")
@@ -999,6 +1036,15 @@ def _entry_dict(e: Entry) -> dict[str, Any]:
             "size": e.size, "mtime": e.mtime}
 
 
+def _size_text(e: Entry) -> str:
+    """人类可读输出里的大小列。服务端没报大小就写 `?`。
+
+    不能退化写成 `0 B`：`0 B` 是一个确定的事实，而"不知道"不是 —— 这跟
+    `Entry.size` 用 None 而不是 0 表示未知是同一条理由。
+    """
+    return "?" if e.size is None else format_size(e.size)
+
+
 def _print_entries(entries, as_json: bool) -> None:
     if as_json:
         print(json.dumps([_entry_dict(e) for e in entries],
@@ -1008,7 +1054,7 @@ def _print_entries(entries, as_json: bool) -> None:
         if e.is_dir:
             print(f"  {'<dir>':>10}  {e.name}/")
         else:
-            print(f"  {format_size(e.size):>10}  {e.name}")
+            print(f"  {_size_text(e):>10}  {e.name}")
 
 
 def _make_dav(cfg: Config) -> WebDAV:
@@ -1088,9 +1134,11 @@ def _print_entry(e: Entry, as_json: bool) -> None:
     if as_json:
         print(json.dumps(_entry_dict(e), ensure_ascii=False, indent=2))
     elif e.is_dir:
-        print(f"{e.path}/")
+        # e.path 对集合**已经**带尾斜杠（parse_multistatus 补的），这里再拼
+        # 一个就成 `/d//`，根上甚至是 `//`。`ls` 那边用的是 e.name，没这问题。
+        print(e.path)
     else:
-        print(f"{e.path}  {format_size(e.size)}")
+        print(f"{e.path}  {_size_text(e)}")
 
 
 def cmd_ls(dav, args) -> int:
@@ -1127,6 +1175,10 @@ def cmd_get(dav, args) -> int:
     remote = normalize_remote_path(args.remote)
     local = args.local or os.path.basename(remote.rstrip("/")) or "download"
     if args.dry_run:
+        # dry-run 的承诺是"打印真跑会发生的事"（同 cmd_rm）。目标是目录时真跑
+        # 会被 download() 拒掉，所以这里也得先看清楚再开口。
+        if dav.stat(remote).is_dir:
+            raise NsdavError(f"{remote} 是目录，不能下载")
         print(f"将下载 {remote} → {local}")
         return EXIT_OK
     path, n = download(dav, remote, local, transport=dav.t,
@@ -1140,6 +1192,10 @@ def cmd_put(dav, args) -> int:
     remote = normalize_remote_path(
         args.remote or "/" + os.path.basename(args.local))
     if args.dry_run:
+        # 同样的道理：真跑会在 upload() 里以"本地文件不存在"（用法错 2）退出，
+        # 这里打印"将上传"就是承诺一件做不到的事。
+        if not os.path.isfile(args.local):
+            raise UsageError(f"本地文件不存在: {args.local}")
         print(f"将上传 {args.local} → {remote}")
         return EXIT_OK
     n = upload(dav, args.local, remote, verify=args.verify)
@@ -1200,7 +1256,10 @@ def cmd_rm(dav, args) -> int:
 
 def cmd_mv(dav, args) -> int:
     if args.dry_run:
-        print(f"将移动 {args.src} → {args.dst}")
+        # 打印**规范化之后**的两端：原样回显 `../d/x` 会让人以为能跑出挂载点，
+        # 而真跑时 normalize_remote_path 会把它折回根内。
+        print(f"将移动 {normalize_remote_path(args.src)} → "
+              f"{normalize_remote_path(args.dst)}")
         return EXIT_OK
     dav.move(args.src, args.dst)
     return EXIT_OK
@@ -1208,7 +1267,8 @@ def cmd_mv(dav, args) -> int:
 
 def cmd_cp(dav, args) -> int:
     if args.dry_run:
-        print(f"将复制 {args.src} → {args.dst}")
+        print(f"将复制 {normalize_remote_path(args.src)} → "
+              f"{normalize_remote_path(args.dst)}")
         return EXIT_OK
     dav.copy(args.src, args.dst)
     return EXIT_OK

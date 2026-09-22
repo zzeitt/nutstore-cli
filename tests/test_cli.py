@@ -292,3 +292,266 @@ def test_rm_dir_without_recursive_is_a_usage_error(live_dav, capsys):
     assert "/d" in live_dav.dirs
     assert "/d/one.txt" in live_dav.store
 
+
+
+# ── 复审补的用例：stat 的双斜杠、--dry-run 的承诺、main 的两个出口 ──
+
+def test_stat_on_a_directory_has_no_double_slash(live_dav, capsys):
+    """`stat` 打目录时路径**只带一个**尾斜杠（复审发现的回归）。
+
+    `Entry.path` 对集合已经带尾斜杠（parse_multistatus 补的），`_print_entry`
+    又拼了一个，于是 `stat /d` 打成 `/d//`、`stat /` 打成 `//`。`ls` 那条路用
+    的是 e.name，一直是好的 —— 所以这个 bug 只在 stat 上现形。
+
+    顺带钉住文件那条路没被带坏：文件的 path 不带尾斜杠，输出就不该有。
+    """
+    code, out, _ = run(capsys, "stat", "/d")
+    assert code == 0
+    assert out.strip() == "/d/", out
+
+    code, out, _ = run(capsys, "stat", "/")
+    assert code == 0
+    assert out.strip() == "/", out
+
+    code, out, _ = run(capsys, "stat", "/d/one.txt")
+    assert code == 0
+    assert out.strip() == "/d/one.txt  1 B", out
+
+
+def test_dry_run_put_refuses_a_missing_local_file(live_dav, capsys, tmp_path):
+    """`--dry-run put` 不能承诺一件真跑做不到的事。
+
+    `cmd_rm` 特意先 stat 就是为了这条契约（真跑必被拒的输入，dry-run 也不许
+    打印"将删除"）。put 之前没跟上：本地文件不存在时 dry-run 打印"将上传"并
+    以 0 退出，而真跑是"错误: 本地文件不存在"、退出 2。
+
+    断言四层：退出码与真跑一致（2）、没有"将上传"、一个 PUT 都没发出去、
+    真跑的退出码确实是 2（把两边钉在一起，不是各说各话）。
+    """
+    missing = str(tmp_path / "nope.txt")
+
+    code, out, err = run(capsys, "--dry-run", "put", missing, "/d/x.txt")
+    assert code == nsdav.EXIT_USAGE
+    assert "将上传" not in out
+    assert "不存在" in err
+    assert not [m for m, _ in live_dav.requests if m == "PUT"]
+
+    assert run(capsys, "put", missing, "/d/x.txt")[0] == nsdav.EXIT_USAGE
+
+
+def test_dry_run_mv_and_cp_print_normalized_paths(live_dav, capsys):
+    """dry-run 打印的必须是**规范化之后**的两端。
+
+    原样回显 `../d/two.txt` 会让人以为能跑出挂载点（真跑会把它折回根内）。
+    断言"打印了什么"和"真跑做了什么"是同一件事。
+    """
+    code, out, _ = run(capsys, "--dry-run", "mv", "./d/one.txt", "../d/two.txt")
+    assert code == 0
+    assert out.strip() == "将移动 /d/one.txt → /d/two.txt", out
+
+    code, out, _ = run(capsys, "--dry-run", "cp", "d/one.txt", "/d//sub/")
+    assert code == 0
+    assert out.strip() == "将复制 /d/one.txt → /d/sub", out
+
+    assert not [m for m, _ in live_dav.requests if m in ("MOVE", "COPY")]
+    assert "/d/one.txt" in live_dav.store
+
+
+def test_dry_run_get_on_a_directory_is_refused(live_dav, capsys):
+    """`--dry-run get` 对目录同样要拒（真跑会被 download 拒掉）。"""
+    code, out, err = run(capsys, "--dry-run", "get", "/d")
+    assert code == nsdav.EXIT_ERROR
+    assert "将下载" not in out
+    assert "是目录" in err
+    assert not [m for m, _ in live_dav.requests if m == "GET"]
+
+    # 真跑同一个输入，退出码要一致
+    assert run(capsys, "get", "/d", "/tmp/whatever")[0] == nsdav.EXIT_ERROR
+
+
+def test_keyboard_interrupt_exits_130(live_dav, capsys, monkeypatch):
+    """Ctrl-C 的退出码 130 写在 README 的表里，但没有任何用例走到过这条路。"""
+    def boom(args, dav):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(nsdav, "_dispatch", boom)
+    code, _, err = run(capsys, "ls", "/d")
+    assert code == 130
+    assert "已中断" in err
+
+
+def test_broken_pipe_counts_as_success(live_dav, capsys, monkeypatch):
+    """`cat 大文件 | head` —— 下游提前关管道算成功（README 明写的特例）。
+
+    BrokenPipeError 不是 NsdavError，没有那条 except 就是 traceback。
+    """
+    def boom(args, dav):
+        raise BrokenPipeError
+
+    monkeypatch.setattr(nsdav, "_dispatch", boom)
+    code, _, err = run(capsys, "cat", "/d/one.txt")
+    assert code == nsdav.EXIT_OK == 0
+    assert err == ""
+
+
+def test_unreachable_server_exits_with_the_network_code(monkeypatch, capsys):
+    """连不上时退出码是 6（README 的表里写着，此前没有用例验过）。
+
+    打一个刚关掉的端口，不 mock：这条路的进口是裸 socket 错误。
+    """
+    s = MockDAV()
+    base = s.start()
+    s.stop()
+    monkeypatch.setenv("NSDAV_WEBDAV_URL", base + "/dav")
+    monkeypatch.setenv("NSDAV_WEBDAV_USER", "u")
+    monkeypatch.setenv("NSDAV_WEBDAV_PASSWORD", "p")
+
+    code, _, err = run(capsys, "--max-retries", "0", "ls", "/")
+    assert code == nsdav.EXIT_NETWORK == 6
+    assert "错误" in err and "Traceback" not in err
+
+
+def test_rm_recursive_aborts_when_stdin_is_closed(live_dav, capsys, monkeypatch):
+    """stdin 关着（脚本、CI）时"问不到答案"要算不确认，不是抛 traceback。"""
+    def eof(prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    code, _, _ = run(capsys, "rm", "-r", "/d")
+    assert code == nsdav.EXIT_ERROR
+    assert "/d/one.txt" in live_dav.store
+
+
+def test_quiet_suppresses_progress_and_done_lines(live_dav, capsys, tmp_path):
+    """`--quiet` 之后 stdout 与 stderr 都该是空的（数据只有 stderr 那两行）。"""
+    src = tmp_path / "q.txt"
+    src.write_bytes(b"q")
+
+    code, out, err = run(capsys, "--quiet", "put", str(src), "/d/q.txt")
+    assert code == 0
+    assert out == "" and err == ""
+
+    code, out, err = run(capsys, "--quiet", "get", "/d/q.txt", str(tmp_path / "q2"))
+    assert code == 0
+    assert out == "" and err == ""
+
+
+def test_verbose_only_logs_retries_not_every_request(live_dav, capsys):
+    """`-v` 实际只打**重试**日志，而 README 承诺的是"把每个请求写到 stderr"。
+
+    这条钉的是现状，不是承诺 —— 写用例的时候先按 README 写成了"成功的请求也
+    会打 `  · `"，跑出来 stderr 是空的，于是去读实现：`_log()` 全项目只有两个
+    调用点（nsdav.py:496 连接错误重试、nsdav.py:510 状态码重试），顺利走完的
+    请求一次都不打。也就是说 `-v` 目前近乎一条死路，而 README:99 和
+    argparse 的 help（"打印请求日志"）都还在承诺另一件事。
+
+    这里**不**顺手改实现（超出这一轮的范围），只把现状钉死：哪天有人把请求
+    日志补上，这条会红，红得正是时候 —— 它逼着改动方同时更新这句话。
+
+    stderr 走重试那条：发一次 503，日志必须出现，且带退避秒数。
+    """
+    live_dav.fail_first_n = 1
+    live_dav.fail_status = 503
+
+    code, out, err = run(capsys, "-v", "--min-gap", "0", "--max-retries", "1",
+                         "ls", "/d")
+    assert code == 0
+    assert "  · " in err and "503" in err
+    assert "one.txt" in out and "one.txt" not in err
+
+    # 一路顺利的请求：现状是一个字都不打（README 说会打）
+    code, out, err = run(capsys, "-v", "--min-gap", "0", "ls", "/d")
+    assert code == 0
+    assert err == "", f"-v 居然打了请求日志，README 那句话该更新了: {err!r}"
+
+
+def test_quiet_beats_verbose(live_dav, capsys):
+    """两个一起给时 quiet 赢（`_VERBOSE = args.verbose and not args.quiet`）。
+
+    必须在**有日志可打**的路径上验（503 重试），否则 `err == ""` 对安静的实
+    现和坏掉的实现同样成立，这条用例就什么也没钉住。
+    """
+    live_dav.fail_first_n = 1
+    live_dav.fail_status = 503
+
+    code, out, err = run(capsys, "-v", "-q", "--min-gap", "0",
+                         "--max-retries", "1", "ls", "/d")
+    assert code == 0
+    assert "  · " not in err
+    assert "one.txt" in out
+
+
+def test_progress_is_silent_for_an_empty_file(live_dav, capsys, tmp_path):
+    """空文件（total == 0）不能打出 0/0 的百分比。"""
+    live_dav.add_file("/d/empty.bin", b"")
+    dest = tmp_path / "empty.bin"
+
+    code, _, err = run(capsys, "get", "/d/empty.bin", str(dest))
+    assert code == 0 and dest.read_bytes() == b""
+    assert "%" not in err
+
+
+# ── 复审补的用例：tree 的 --json/-d、format_size 的高位单位 ──
+
+def test_tree_json_and_depth_limit(live_dav, capsys):
+    """`tree -d N` 要真的限深，`--json` 要给出与人类可读同一批条目。
+
+    此前的 tree 用例只走人类可读那条路、且用了默认深度。`--json` 那条会把
+    walk 的生成器物化成 list，是**另一条**代码路径。
+    """
+    live_dav.add_dir("/d/sub")
+    live_dav.add_file("/d/sub/deep.txt", b"x")
+
+    code, out, _ = run(capsys, "--json", "tree", "/d", "-d", "1")
+    assert code == 0
+    names = sorted(e["name"] for e in json.loads(out))
+    assert names == ["one.txt", "sub", "two.txt"], names
+    assert "deep.txt" not in out
+
+    code, out, _ = run(capsys, "--json", "tree", "/d", "-d", "0")
+    assert code == 0
+    assert "deep.txt" in out
+
+
+def test_format_size_upper_units():
+    """GiB / TiB / PiB 三段此前一个都没断言过，而封顶那段（PiB）只在这里可见。"""
+    assert nsdav.format_size(1024 ** 3) == "1.0 GiB"
+    assert nsdav.format_size(1024 ** 4) == "1.0 TiB"
+    assert nsdav.format_size(1024 ** 5) == "1024.0 PiB"
+
+
+def test_unknown_size_renders_as_a_question_mark(live_dav, capsys, monkeypatch):
+    """服务端不报大小时，人类可读的大小列是 `?`，不是 `0 B`。
+
+    这与 `Entry.size` 用 None 而不是 0 是同一条理由的另一半：解析层分开了
+    "不知道"和"空"，输出层**必须**跟着分开，否则 `0 B` 又把两者合了回去，
+    而且这次是在用户眼前合的。
+
+    用 dataclasses.replace 改真跑出来的条目，让 ls/stat 的其余管路（分页、
+    排序、JSON 那条）都还是真的。
+    """
+    import dataclasses
+    real = nsdav.WebDAV.propfind
+
+    def no_size(self, path, depth="1"):
+        return [dataclasses.replace(e, size=None) if not e.is_dir else e
+                for e in real(self, path, depth)]
+
+    monkeypatch.setattr(nsdav.WebDAV, "propfind", no_size)
+
+    code, out, _ = run(capsys, "ls", "/d")
+    assert code == 0
+    assert "?" in out and "0 B" not in out, out
+
+    code, out, _ = run(capsys, "stat", "/d/one.txt")
+    assert code == 0
+    assert out.strip().endswith("?"), out
+
+    # 目录那行仍然是 <dir>，没被这条改动带歪（列 /d 的子项里没有子目录，
+    # 要列根才会出现 <dir> 那一行）
+    assert "<dir>" in run(capsys, "ls", "/")[1]
+
+    # JSON 那条路给出的是 null（"不知道"），不是 0
+    code, out, _ = run(capsys, "--json", "stat", "/d/one.txt")
+    assert code == 0
+    assert json.loads(out)["size"] is None

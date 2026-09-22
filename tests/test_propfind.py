@@ -168,11 +168,49 @@ def test_base_prefix_does_not_match_a_sibling_directory():
 
 
 def test_missing_size_and_mtime_are_tolerated():
+    """缺 getcontentlength 时 size 是 None（"不知道"），不是 0（"空"）。
+
+    这条以前断言的是 `e.size == 0`。那个契约本身就是 bug：download() 用
+    `total == 0` 表示"远端是空文件"，于是"问不到大小"被当成空文件处理 ——
+    把本地文件截成 0 字节、`os.replace` 覆盖掉，然后返回成功。解析层必须
+    把两者分开，否则上层没有任何办法区分。mtime 那头没这个问题：None 本来
+    就是"没有"。
+    """
     xml = b'''<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response>
     <d:href>/dav/x</d:href><d:propstat><d:prop><d:resourcetype/></d:prop>
     <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'''
     e = nsdav.parse_multistatus(xml, "/dav")[0]
-    assert e.size == 0 and e.mtime is None and not e.is_dir
+    assert e.size is None and e.mtime is None and not e.is_dir
+
+
+def test_unparsable_size_is_unknown_not_zero():
+    """非纯数字的 getcontentlength 同样是"不知道"，不能退化成一个确定的数。
+
+    `1,024` / `12 KB` / 空元素都是 RFC 允许服务端发出来的形状。旧实现在这些
+    值上落到 `size = 0`，与"缺元素"一起构成同一个静默失败面。
+    """
+    for value in (b"", b"1,024", b"12 KB", b"  "):
+        xml = (b'<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response>'
+               b'<d:href>/dav/x</d:href><d:propstat><d:prop><d:resourcetype/>'
+               b'<d:getcontentlength>' + value + b'</d:getcontentlength>'
+               b'</d:prop><d:status>HTTP/1.1 200 OK</d:status>'
+               b'</d:propstat></d:response></d:multistatus>')
+        e = nsdav.parse_multistatus(xml, "/dav")[0]
+        assert e.size is None, (value, e.size)
+
+
+def test_explicit_zero_size_is_still_zero():
+    """而服务端**明说** 0 时仍然是 0 —— "空文件"这条路不能被上面的改动吃掉。
+
+    没有这条，把 `size = None` 写死在解析里（永远不取值）同样是绿的，而
+    真正的空文件下载会全部失败。
+    """
+    xml = b'''<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response>
+    <d:href>/dav/x</d:href><d:propstat><d:prop><d:resourcetype/>
+    <d:getcontentlength>0</d:getcontentlength></d:prop>
+    <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'''
+    e = nsdav.parse_multistatus(xml, "/dav")[0]
+    assert e.size == 0
 
 
 def test_dir_path_keeps_trailing_slash():
