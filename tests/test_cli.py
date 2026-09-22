@@ -294,6 +294,30 @@ def test_rm_dir_without_recursive_is_a_usage_error(live_dav, capsys):
 
 
 
+# ── 复审补的用例：stat 的双斜杠、--dry-run 的承诺、main 的两个出口 ──
+
+def test_stat_on_a_directory_has_no_double_slash(live_dav, capsys):
+    """`stat` 打目录时路径**只带一个**尾斜杠（复审发现的回归）。
+
+    `Entry.path` 对集合已经带尾斜杠（parse_multistatus 补的），`_print_entry`
+    又拼了一个，于是 `stat /d` 打成 `/d//`、`stat /` 打成 `//`。`ls` 那条路用
+    的是 e.name，一直是好的 —— 所以这个 bug 只在 stat 上现形。
+
+    顺带钉住文件那条路没被带坏：文件的 path 不带尾斜杠，输出就不该有。
+    """
+    code, out, _ = run(capsys, "stat", "/d")
+    assert code == 0
+    assert out.strip() == "/d/", out
+
+    code, out, _ = run(capsys, "stat", "/")
+    assert code == 0
+    assert out.strip() == "/", out
+
+    code, out, _ = run(capsys, "stat", "/d/one.txt")
+    assert code == 0
+    assert out.strip() == "/d/one.txt  1 B", out
+
+
 def test_unknown_size_renders_as_a_question_mark(live_dav, capsys, monkeypatch):
     """服务端不报大小时，人类可读的大小列是 `?`，不是 `0 B`。
 

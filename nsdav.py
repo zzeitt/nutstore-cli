@@ -1134,7 +1134,9 @@ def _print_entry(e: Entry, as_json: bool) -> None:
     if as_json:
         print(json.dumps(_entry_dict(e), ensure_ascii=False, indent=2))
     elif e.is_dir:
-        print(f"{e.path}/")
+        # e.path 对集合**已经**带尾斜杠（parse_multistatus 补的），这里再拼
+        # 一个就成 `/d//`，根上甚至是 `//`。`ls` 那边用的是 e.name，没这问题。
+        print(e.path)
     else:
         print(f"{e.path}  {_size_text(e)}")
 
