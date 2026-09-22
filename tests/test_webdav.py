@@ -284,3 +284,15 @@ def test_put_409_retry_drops_the_connection(tmp_path, dav):
     assert len(made) == 2, f"409 之后复用了旧连接（只建了 {len(made)} 条）"
 
 
+def test_stat_treats_an_empty_multistatus_as_not_found(dav):
+    """207 但零条目与"真 404"抛同一个 NotFoundError。
+
+    test_live.py 里点明过这个区别没人钉：服务端 404 那条已有用例，而"207 里
+    一条 response 都没有"没有被读过 —— `stat()` 掉进 `if not entries` 这条闸
+    才算数，去掉它就是一个 IndexError。
+    """
+    s, base = dav
+    d = _dav(s, base)
+    d.propfind = lambda *a, **kw: []
+    with pytest.raises(nsdav.NotFoundError):
+        d.stat("/whatever")

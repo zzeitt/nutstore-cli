@@ -202,3 +202,92 @@ def test_stream_body_retry_reopens_file(tmp_path, dav):
     assert s.store["/f.bin"] == b"abcdef"   # 重试后内容完整，不是空的
 
 
+# ── 复审补的用例：连接失败路径与状态码映射 ──
+
+def test_connection_failure_raises_network_error_after_retries(dav):
+    """连不上要走 NetworkError（退出码 6），并且真的退避重试过。
+
+    整条连接失败路径此前**一条用例都没走到**：README 的退出码表里写着 6、
+    代码里有 `raise NetworkError`，而 177 条用例没有一条让它执行过。所以
+    "把 `raise` 改成 `return None`"这种变异是静默的。
+
+    断言四层：异常类型、退出码、试了几次（首次 + max_retries）、退避序列
+    （连接错误 0.5 秒起跳，与 503 的 2 秒不同）。
+    """
+    s, base = dav
+    t = _transport(base, max_retries=2, rand=lambda: 0.5)
+    sleeps = []
+    t._sleep = sleeps.append
+    attempts = []
+
+    def boom():
+        attempts.append(1)
+        raise OSError("connection refused")
+
+    t._new_conn = boom
+    with pytest.raises(nsdav.NetworkError) as ei:
+        t.request("PROPFIND", "/dav/", depth="0")
+
+    assert ei.value.exit_code == nsdav.EXIT_NETWORK == 6
+    assert len(attempts) == 3, f"只试了 {len(attempts)} 次"
+    assert sleeps == [0.5, 1.0], sleeps
+    assert s.requests == []          # 一个请求都没发出去
+
+
+def test_connection_failure_gives_up_immediately_without_retries(dav):
+    """max_retries=0 时第一次失败就报错，不再退避等待。"""
+    s, base = dav
+    t = _transport(base, max_retries=0)
+    sleeps = []
+    t._sleep = sleeps.append
+    t._new_conn = lambda: (_ for _ in ()).throw(OSError("refused"))
+    with pytest.raises(nsdav.NetworkError):
+        t.request("PROPFIND", "/dav/", depth="0")
+    assert sleeps == []
+
+
+def test_stream_connection_failure_raises_network_error():
+    """`stream()` 的连接失败也必须落进 NetworkError。
+
+    下载整条路都走 stream，所以"连不上 / 下到一半断了"是最可能发生的真实
+    故障，而它的处理器此前从没被执行过（漏出去就是绕开退出码映射的裸
+    OSError，用户看到 traceback 而不是"退出码 6 + 一句话"）。
+
+    用一个**刚刚关掉的**端口打真 socket，不 mock：假造的 OSError 只能证明
+    `except` 那行长什么样，证明不了连接失败真的走到那里。
+    """
+    s = MockDAV()
+    base = s.start()
+    s.stop()                          # 端口上已经没人听了
+    t = _transport(base)
+    with pytest.raises(nsdav.NetworkError, match="失败"):
+        with t.stream("GET", "/dav/x.bin"):
+            pass
+
+
+def test_403_maps_to_a_permission_error():
+    """403 要落到"没有权限"那句话上，而不是被当成未映射状态。"""
+    s = MockDAV(fail_first_n=99, fail_status=403)
+    base = s.start()
+    try:
+        t = _transport(base, max_retries=0)
+        r = t.request("GET", "/dav/x")
+        assert r.status == 403
+        with pytest.raises(nsdav.NsdavError, match="没有权限") as ei:
+            t.raise_for_status_or_raise(r)
+        assert ei.value.exit_code == nsdav.EXIT_ERROR
+    finally:
+        s.stop()
+
+
+def test_unmapped_status_is_reported_verbatim(dav):
+    """没专门映射的状态码也要说清是几号 —— 走的是最后那条兜底。
+
+    409 / 500 / 501 / 507 重试耗尽后都是从这条出去的，此前没有用例钉它。
+    """
+    s, base = dav
+    t = _transport(base)
+    r = t.request("PATCH", "/dav/x")        # mock 的 _unsupported 回 501
+    assert r.status == 501
+    with pytest.raises(nsdav.NsdavError, match="HTTP 501"):
+        t.raise_for_status_or_raise(r)

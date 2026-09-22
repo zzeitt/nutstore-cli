@@ -1,4 +1,5 @@
 import contextlib
+import io
 import os
 import pytest
 import random
@@ -489,6 +490,140 @@ def test_download_refuses_when_the_remote_size_is_unknown(tmp_path):
 
     assert dest.read_bytes() == b"IMPORTANT" * 100
     assert sorted(p.name for p in tmp_path.iterdir()) == ["notes.md"]
+
+
+def test_download_refuses_a_directory(tmp_path):
+    """目标是目录时必须拒 —— 这是 cmd_get 唯一的守卫（它自己不 stat）。
+
+    拒绝之后不能留下 .part：一个先建空 .part 再报错的实现会在地上留垃圾，
+    而 .part 会被下一次续传当成进度。
+    """
+    stub = _StubDav(nsdav.Entry(path="/d/", name="d", is_dir=True,
+                                size=0, mtime=None))
+    with pytest.raises(nsdav.NsdavError, match="是目录"):
+        nsdav.download(stub, "/d", str(tmp_path / "d"))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_reports_an_unexpected_status(dav, tmp_path, monkeypatch):
+    """非 200/206 的响应要变成一句话，而不是把那个 body 当文件写下去。
+
+    stat 说文件在、有 5 字节，而 GET 回 404 —— 这条路此前没有任何用例走到。
+    """
+    s, base = dav
+    d, t = _dav(s, base)
+    monkeypatch.setattr(d, "stat", lambda p: nsdav.Entry(
+        path="/gone.bin", name="gone.bin", is_dir=False, size=5, mtime=None))
+
+    dest = tmp_path / "gone.bin"
+    with pytest.raises(nsdav.NsdavError, match="HTTP 404"):
+        nsdav.download(d, "/gone.bin", str(dest), transport=t)
+    assert not dest.exists()
+
+
+def test_download_leaves_part_behind_when_the_body_is_short(dav, tmp_path,
+                                                            monkeypatch):
+    """终检是"半截内容覆盖真文件"之前的最后一道闸。
+
+    服务端忽略 Range、整份回了一份短于 getcontentlength 的 body。没有终检，
+    这份半截内容会被 `os.replace` 改成目标名并以成功退出。断言：报错、目标
+    不存在、.part 留着（续传的承诺就是这么写的）。
+    """
+    s, base = dav
+    s.add_file("/short.bin", b"abc")             # 远端其实只有 3 字节
+    s.ignore_range = True
+    d, t = _dav(s, base)
+    monkeypatch.setattr(d, "stat", lambda p: nsdav.Entry(
+        path="/short.bin", name="short.bin", is_dir=False, size=10, mtime=None))
+
+    dest = tmp_path / "short.bin"
+    with pytest.raises(nsdav.NsdavError, match="下载不完整"):
+        nsdav.download(d, "/short.bin", str(dest), transport=t)
+    assert not dest.exists()
+    assert (tmp_path / "short.bin.part").read_bytes() == b"abc"
+
+
+def test_download_detects_a_stalled_range_request(dav, tmp_path, monkeypatch):
+    """206 回了 0 字节 = 服务端卡住，必须报错。
+
+    没有这道闸就是死循环：offset 不变、Range 不变，`while offset < total`
+    永远成立。顺带钉住"只试了两次"—— 一个"空转 N 次再放行"的实现会在这里
+    露出来（会多发几次范围请求）。
+    """
+    s, base = dav
+    s.add_file("/stall.bin", b"abc")
+    d, t = _dav(s, base)
+    monkeypatch.setattr(d, "stat", lambda p: nsdav.Entry(
+        path="/stall.bin", name="stall.bin", is_dir=False, size=10, mtime=None))
+
+    ranges = []
+    real_stream = t.stream
+
+    def spy(method, target, **kw):
+        hdr = kw.get("headers") or {}
+        if "Range" in hdr:
+            ranges.append(hdr["Range"])
+        return real_stream(method, target, **kw)
+
+    t.stream = spy
+    with pytest.raises(nsdav.NsdavError, match="卡住"):
+        nsdav.download(d, "/stall.bin", str(tmp_path / "stall.bin"), transport=t)
+    assert ranges == ["bytes=0-9", "bytes=3-9"], ranges
+
+
+def test_upload_refuses_a_missing_local_file(dav, tmp_path):
+    """本地路径打错时以用法错（2）退出，而不是发一个空 body 上去。
+
+    `os.path.getsize` 对不存在的路径抛 FileNotFoundError —— 那会绕开异常树
+    变成 traceback。先 isfile 挡一道，退出码才是 2。
+    """
+    s, base = dav
+    d, t = _dav(s, base)
+    with pytest.raises(nsdav.UsageError, match="本地文件不存在") as ei:
+        nsdav.upload(d, str(tmp_path / "nope.txt"), "/x.txt")
+    assert ei.value.exit_code == nsdav.EXIT_USAGE == 2
+    assert s.requests == []                      # 一个请求都没发出去
+
+
+def test_upload_strong_verify_rejects_an_unexpected_readback_status(dav,
+                                                                    tmp_path,
+                                                                    monkeypatch):
+    """回读校验拿到非 200/206 时要说清楚，不能拿空 body 去比对后报"内容不一致"。
+
+    两种报错都"是错误"，但一个是"校验做不了"，另一个是"内容坏了"，对用户的
+    下一步动作完全不同。
+    """
+    s, base = dav
+    d, t = _dav(s, base)
+    src = tmp_path / "u.txt"
+    src.write_bytes(b"z" * 10)
+
+    @contextlib.contextmanager
+    def bad_stream(method, target, **kw):
+        yield nsdav.Response(500, {}, io.BytesIO(b""))
+
+    monkeypatch.setattr(t, "stream", bad_stream)
+    with pytest.raises(nsdav.NsdavError, match="回读校验失败"):
+        nsdav.upload(d, str(src), "/u.txt", verify="strong")
+
+
+def test_upload_reports_progress_once_at_the_end(dav, tmp_path):
+    """upload 的 progress 契约：传完校验通过后报一次 (size, size)。
+
+    此前 download 的 progress 有三条用例，upload 的一条都没有 —— 回调传了
+    等于没传，删掉 `if progress:` 那段谁都不会红。
+    """
+    s, base = dav
+    d, t = _dav(s, base)
+    src = tmp_path / "u.txt"
+    src.write_bytes(b"payload")
+
+    seen = []
+    n = nsdav.upload(d, str(src), "/u.txt",
+                     progress=lambda done, total: seen.append((done, total)))
+
+    assert n == 7
+    assert seen == [(7, 7)], seen
 
 
 def test_upload_refuses_when_the_remote_size_is_unknown(dav, tmp_path):
